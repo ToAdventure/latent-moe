@@ -2,6 +2,7 @@ import sys
 import os
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
+sys.path.insert(0, os.path.dirname(current_dir))
 # os.environ["WANDB_DISABLED"] = "true"
 import fire
 import torch
@@ -9,11 +10,13 @@ import torch.nn as nn
 
 import trl
 from datasets import Dataset as HFDataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from model import LatentModel
 
 from latent_grpo_dataset import D3Dataset, get_hash, get_prefix_data
 from grpo_trainer import NoiseGRPORecTrainer
+from fsdp2_utils import build_fsdp2_config, configure_fsdp2_environment
+from latent_moe import set_latent_layer_config
 
 
 def train(
@@ -24,6 +27,17 @@ def train(
     info_file: str = "data/info/Toys_and_Games_5_2017-1-2018-11.txt",
     lr: float = float(6.0e-6),
     end_k: int = -1,
+    latent_layer_type: str = "auto",
+    moe_num_experts: int = 4,
+    moe_top_k: int = 2,
+    moe_expert_hidden_size: int = 0,
+    moe_expert_hidden_multiplier: float = 1.0,
+    moe_dropout: float = 0.0,
+    moe_router_temperature: float = 1.0,
+    moe_router_jitter_noise: float = 0.0,
+    moe_fine_grained_factor: int = 2,
+    moe_num_shared_experts: int = 1,
+    moe_shared_expert_weight: float = 1.0,
     num_epochs: int = 1,
     batch_size: int = 256,
     micro_batch_size: int = 8,
@@ -45,8 +59,14 @@ def train(
 
     resume_from_checkpoint: str = None,
     local_rank: int = 0,
+    use_fsdp2: bool = True,
+    fsdp2_activation_checkpointing: bool = False,
+    fsdp2_state_dict_type: str = "FULL_STATE_DICT",
 
 ):
+    configure_fsdp2_environment(use_fsdp2, fsdp2_state_dict_type)
+    if use_fsdp2 and beta != 0.0:
+        raise ValueError("FSDP2 only supports one model in this training path; set beta=0.0 or disable use_fsdp2.")
     # print(train_file)
     category_dict = {"Office_Products": "office products", "Books": "books", "steam": "games",
                      "CDs_and_Vinyl": "musics", "Toys_and_Games": "toys and games", "Video_Games": "video games",
@@ -57,7 +77,6 @@ def train(
     category = category_dict[category]
     print(lr, type(lr))
     # alloc_first(all_s=70)
-    device_map = "auto"
     gradient_accumulation_steps = batch_size // micro_batch_size
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
@@ -66,7 +85,24 @@ def train(
 
     assert batch_size==micro_batch_size*gradient_accumulation_steps*world_size
 
+    model_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    set_latent_layer_config(
+        model_config,
+        latent_layer_type=latent_layer_type,
+        end_k=end_k,
+        moe_num_experts=moe_num_experts,
+        moe_top_k=moe_top_k,
+        moe_expert_hidden_size=moe_expert_hidden_size,
+        moe_expert_hidden_multiplier=moe_expert_hidden_multiplier,
+        moe_dropout=moe_dropout,
+        moe_router_temperature=moe_router_temperature,
+        moe_router_jitter_noise=moe_router_jitter_noise,
+        moe_fine_grained_factor=moe_fine_grained_factor,
+        moe_num_shared_experts=moe_num_shared_experts,
+        moe_shared_expert_weight=moe_shared_expert_weight,
+    )
     model = LatentModel.from_pretrained(base_model,
+        config=model_config,
         torch_dtype=torch.bfloat16,
     )
     model.attention.end_k = end_k
@@ -124,7 +160,6 @@ def train(
         model=model,
         reward_funcs=reward_funcs,
         args= trl.GRPOConfig(
-            # deepspeed='scripts/zero2.json',
             warmup_steps=200,
             # warmup_ratio=0.05,
             num_generations=num_generations,
@@ -151,7 +186,9 @@ def train(
             save_steps=200,
             save_total_limit=2,
             load_best_model_at_end=False,
-            ddp_find_unused_parameters=True,
+            ddp_find_unused_parameters=None if use_fsdp2 else True,
+            fsdp="auto_wrap" if use_fsdp2 else "",
+            fsdp_config=build_fsdp2_config(fsdp2_activation_checkpointing) if use_fsdp2 else None,
             report_to="none",
             bf16=True,
             logging_steps=1,
@@ -174,11 +211,8 @@ def train(
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
     trainer.save_state()
-    model.save_pretrained(output_dir)
+    trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
 
 if __name__ == "__main__":
     fire.Fire(train)
-
-
-

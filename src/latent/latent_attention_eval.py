@@ -29,7 +29,8 @@ def main(
     seed: int = 0,
     temperature: float=1.0,
     guidance_scale: float=1.0,
-    length_penalty: float=1.0
+    length_penalty: float=1.0,
+    prompt_style: str = "default"
 ):
     category_dict = {"Office_Products": "office products", "Books": "books", "steam": "games", "CDs_and_Vinyl": "musics", "Toys_and_Games": "toys and games", "Video_Games": "video games", "Musical_Instruments": "music instruments", "Sports_and_Outdoors": "sports and outdoors", "Pet_Supplies": "pet supplies", "Arts_Crafts_and_Sewing": "arts products", "STEAM": "games", "Movies": "movie",
                      "yelp": "resturant" }
@@ -51,7 +52,7 @@ def main(
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
-    val_dataset=LatentRDataset(train_file=test_data_path, tokenizer=tokenizer,max_len=2560, category=category, test=True,K=4, seed=seed,
+    val_dataset=LatentRDataset(train_file=test_data_path, tokenizer=tokenizer,max_len=2560, category=category, test=True,K=4, seed=seed, prompt_style=prompt_style,
                               sample=sample)
         
     encodings = [val_dataset.__getitem__(i) for i in range(len(val_dataset))]
@@ -163,7 +164,6 @@ def main(
 
 if __name__ == '__main__':
     fire.Fire(main)
-
 
 
 

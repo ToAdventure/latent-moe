@@ -43,6 +43,14 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             pad_token_id=self.processing_class.pad_token_id,
         )
 
+    def _unwrap_latent_model(self, model=None):
+        model = self.model if model is None else model
+        if hasattr(self, "accelerator"):
+            return self.accelerator.unwrap_model(model)
+        if hasattr(model, "module"):
+            return model.module
+        return model
+
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
@@ -61,13 +69,7 @@ class NoiseGRPORecTrainer(GRPOTrainer):
 
     def my_get_per_token_logps(self, model, input_ids, inputs_embeds, attention_mask, logits_to_keep):
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
-        if hasattr(model, 'module'):
-            model = model.module
-        # Ensure we are using the unwrapped model if necessary (e.g., DDP)
-        if hasattr(model, 'module'):
-            model_to_call = model.module
-        else:
-            model_to_call = model
+        model_to_call = self._unwrap_latent_model(model)
 
         # Call the model's forward method directly.
         # This ensures LatentModel.forward is called, which handles inputs_embeds
@@ -122,12 +124,13 @@ class NoiseGRPORecTrainer(GRPOTrainer):
         # then calculate the PPL and re-generate embeddings to get better PPL
         with torch.no_grad():
             batch_size = prompt_completion_ids.size(0)
-            original_embeds = self.model.generate_embs(prompt_completion_ids, prompt_completion_mask)
+            latent_model = self._unwrap_latent_model()
+            original_embeds = latent_model.generate_embs(prompt_completion_ids, prompt_completion_mask)
             where_thought_ids = torch.nonzero(
-                prompt_completion_ids == self.model.model.embed_tokens.num_embeddings - 1
+                prompt_completion_ids == latent_model.model.embed_tokens.num_embeddings - 1
             )
             noise = torch.randn(
-                (batch_size, original_embeds.size(-1)), device=self.model.device
+                (batch_size, original_embeds.size(-1)), device=original_embeds.device
             ).mul(1.5)
             noise[0, :] = 0
             original_embeds[torch.arange(batch_size), where_thought_ids[:, 1]] += noise
@@ -209,9 +212,10 @@ class NoiseGRPORecTrainer(GRPOTrainer):
         original_embeds = inputs["original_embeds"]
         
         noise = inputs["noise"]
-        embeds = self.model.generate_embs(input_ids, attention_mask)
+        latent_model = self._unwrap_latent_model()
+        embeds = latent_model.generate_embs(input_ids, attention_mask)
         where_thought_ids = torch.nonzero(
-            input_ids == self.model.model.embed_tokens.num_embeddings - 1
+            input_ids == latent_model.model.embed_tokens.num_embeddings - 1
         )
         batch_size = input_ids.size(0)
         embeds[torch.arange(batch_size), where_thought_ids[:, 1]] += noise

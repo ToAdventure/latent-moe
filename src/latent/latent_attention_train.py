@@ -2,6 +2,7 @@ import sys
 import os
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
+sys.path.insert(0, os.path.dirname(current_dir))
 import fire
 import torch
 
@@ -10,15 +11,18 @@ from transformers import (
     AutoTokenizer,
     EarlyStoppingCallback,
     DataCollatorForSeq2Seq,
+    AutoConfig,
 )
 
 from layers import LatentModel
 from reasoning_dataset import LatentRDataset
+from fsdp2_utils import build_fsdp2_config, configure_fsdp2_environment
+from latent_moe import set_latent_layer_config
 # torch.backends.cuda.enable_cudnn_sdp(False)
 
 def train(
     # model/data params
-    base_model: str = "/data1/huggingface/models--Qwen--Qwen2.5-1.5B/",  # the only required argument
+    base_model: str = "/data/gtq/latent-moe/models/Qwen2.5-1.5B",  # the only required argument
     train_file: str="data/train/Toys_and_Games_5_2017-1-2018-11.csv",
     eval_file: str="data/train/Toys_and_Games_5_2017-1-2018-11.csv",
     output_dir: str = "./output_test/",
@@ -26,6 +30,17 @@ def train(
     seed: int = 0,
     # attention hyper parameters
     end_k: int = -1,
+    latent_layer_type: str = "attention",
+    moe_num_experts: int = 4,
+    moe_top_k: int = 2,
+    moe_expert_hidden_size: int = 0,
+    moe_expert_hidden_multiplier: float = 1.0,
+    moe_dropout: float = 0.0,
+    moe_router_temperature: float = 1.0,
+    moe_router_jitter_noise: float = 0.0,
+    moe_fine_grained_factor: int = 2,
+    moe_num_shared_experts: int = 1,
+    moe_shared_expert_weight: float = 1.0,
     
     # training hyperparams
     batch_size: int = 128,
@@ -40,11 +55,15 @@ def train(
     resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
     
     local_rank: int = 0,
-    deepspeed: str ="./deepspeed.json",
+    use_fsdp2: bool = True,
+    fsdp2_activation_checkpointing: bool = False,
+    fsdp2_state_dict_type: str = "FULL_STATE_DICT",
     category: str="Toys_and_Games",
-    K: int = 0
+    K: int = 0,
+    prompt_style: str = "default"
 
 ):
+    configure_fsdp2_environment(use_fsdp2, fsdp2_state_dict_type)
 
     category_dict = {"Office_Products": "office products", "Books": "books", "steam": "games", "CDs_and_Vinyl": "musics", "Toys_and_Games": "toys and games", "Video_Games": "video games", "Musical_Instruments": "music instruments", "Sports_and_Outdoors": "sports and outdoors", "Pet_Supplies": "pet supplies", "Arts_Crafts_and_Sewing": "arts products", "Movies": "movie", "yelp": "resturant"}
     print(category)
@@ -54,15 +73,30 @@ def train(
     )
     gradient_accumulation_steps = batch_size // micro_batch_size
     
-    device_map = "auto"
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
     if ddp:
-        device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
 
+    model_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    set_latent_layer_config(
+        model_config,
+        latent_layer_type=latent_layer_type,
+        end_k=end_k,
+        moe_num_experts=moe_num_experts,
+        moe_top_k=moe_top_k,
+        moe_expert_hidden_size=moe_expert_hidden_size,
+        moe_expert_hidden_multiplier=moe_expert_hidden_multiplier,
+        moe_dropout=moe_dropout,
+        moe_router_temperature=moe_router_temperature,
+        moe_router_jitter_noise=moe_router_jitter_noise,
+        moe_fine_grained_factor=moe_fine_grained_factor,
+        moe_num_shared_experts=moe_num_shared_experts,
+        moe_shared_expert_weight=moe_shared_expert_weight,
+    )
     model = LatentModel.from_pretrained(
         base_model,
+        config=model_config,
         # load_in_8bit=True,
         torch_dtype=torch.bfloat16,
         # device_map=device_map,
@@ -88,8 +122,8 @@ def train(
     ##################
     ##############################################################################
 
-    train_data = LatentRDataset(train_file=train_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category, K = K)
-    val_data = LatentRDataset(train_file=eval_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, category=category, K = K)
+    train_data = LatentRDataset(train_file=train_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category, K = K, prompt_style=prompt_style)
+    val_data = LatentRDataset(train_file=eval_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, category=category, K = K, prompt_style=prompt_style)
 
     print("LOAD DATA FINISHED")
 
@@ -107,13 +141,11 @@ def train(
     hf_train_dataset = HFDataset.from_dict({k: [v[k] for v in train_data] for k in train_data[0].keys()})
     hf_val_dataset = HFDataset.from_dict({k: [v[k] for v in val_data] for k in val_data[0].keys()})
     trainer = transformers.Trainer(
-        # deepspeed=deepspeed,
         model=model,
         train_dataset=hf_train_dataset,
         eval_dataset=hf_val_dataset,
         processing_class=tokenizer,
         args=transformers.TrainingArguments(
-            # deepspeed=deepspeed,
             per_device_train_batch_size=micro_batch_size,
             per_device_eval_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -128,7 +160,9 @@ def train(
             output_dir=output_dir,
             save_total_limit=2,
             load_best_model_at_end=True,
-            ddp_find_unused_parameters=False if ddp else None,
+            ddp_find_unused_parameters=None if use_fsdp2 else (False if ddp else None),
+            fsdp="auto_wrap" if use_fsdp2 else "",
+            fsdp_config=build_fsdp2_config(fsdp2_activation_checkpointing) if use_fsdp2 else None,
             group_by_length=group_by_length,
             report_to="none",
             remove_unused_columns=False
@@ -142,7 +176,7 @@ def train(
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
-    model.save_pretrained(output_dir)
+    trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
 
 

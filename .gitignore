@@ -1,0 +1,20 @@
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local caches and generated outputs
+.cache/
+logs/
+output_dir/
+error.*
+output.*
+
+# Local model weights
+models/
+
+# Extra local dataset shards. Existing tracked sample data remains tracked.
+data/train/*.csv
+data/valid/*.csv
+data/test/*.csv
+data/info/*.txt

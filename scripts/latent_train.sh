@@ -1,3 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep Hugging Face caches off $HOME so large downloads land under /data.
+: "${HF_HOME:=/data/gtq/latent-moe/.cache/huggingface}"
+export HF_HOME
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+
+# Override this from the shell if you place the model somewhere else.
+: "${BASE_MODEL:=/data/gtq/latent-moe/models/Qwen2.5-1.5B}"
+: "${GPU_IDS:=${CUDA_VISIBLE_DEVICES:-0,1,2,3}}"
+: "${LATENT_LAYER_TYPE:=attention}"
+: "${MOE_NUM_EXPERTS:=4}"
+: "${MOE_TOP_K:=2}"
+: "${MOE_EXPERT_HIDDEN_SIZE:=0}"
+: "${MOE_EXPERT_HIDDEN_MULTIPLIER:=1.0}"
+: "${MOE_DROPOUT:=0.0}"
+: "${MOE_ROUTER_TEMPERATURE:=1.0}"
+: "${MOE_ROUTER_JITTER_NOISE:=0.0}"
+: "${MOE_FINE_GRAINED_FACTOR:=2}"
+: "${MOE_NUM_SHARED_EXPERTS:=1}"
+: "${MOE_SHARED_EXPERT_WEIGHT:=1.0}"
+export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
+TRAIN_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}"
+NUM_GPUS=$(( $(tr -cd ',' <<< "${CUDA_VISIBLE_DEVICES}" | wc -c) + 1 ))
+if (( NUM_GPUS < 1 )); then
+    echo "No GPU selected. Set GPU_IDS or CUDA_VISIBLE_DEVICES." >&2
+    exit 1
+fi
 
 # CDs_and_Vinyl
 category="CDs_and_Vinyl"
@@ -6,28 +37,34 @@ train_file=$(ls -f data/train/${category}*11.csv)
 eval_file=$(ls -f data/valid/${category}*11.csv)
 test_file=$(ls -f data/${tdir}/${category}*11.csv)
 info_file=$(ls -f data/info/${category}*.txt)
-echo ${train_file} ${test_fie} ${info_file} ${eval_file}
+echo ${train_file} ${test_file} ${info_file} ${eval_file}
 port=$((RANDOM % 5000 + 10000))
-export CUDA_VISIBLE_DEVICES=6,7
 task_name="latent_${category}"
 out=./output_dir/${category}/latent
 mkdir -p ${out}
 
-# Replace with your actual base model path
-# for example: Qwen/Qwen2.5-1.5B
-BASE_MODEL=/path/to/your/base/model  
-torchrun --nproc_per_node=2 --nnodes=1 --master_port=$port \
+echo "Using BASE_MODEL=${BASE_MODEL}"
+echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} with NUM_GPUS=${NUM_GPUS}"
+echo "Using LATENT_LAYER_TYPE=${LATENT_LAYER_TYPE}"
+torchrun --nproc_per_node=${NUM_GPUS} --nnodes=1 --master_port=$port \
     src/latent/latent_attention_train.py \
     --base_model $BASE_MODEL \
     --train_file ${train_file} --eval_file ${eval_file} \
     --output_dir ${out} --category ${category} --sample -1 \
+    --latent_layer_type ${LATENT_LAYER_TYPE} \
+    --moe_num_experts ${MOE_NUM_EXPERTS} --moe_top_k ${MOE_TOP_K} \
+    --moe_expert_hidden_size ${MOE_EXPERT_HIDDEN_SIZE} \
+    --moe_expert_hidden_multiplier ${MOE_EXPERT_HIDDEN_MULTIPLIER} \
+    --moe_dropout ${MOE_DROPOUT} \
+    --moe_router_temperature ${MOE_ROUTER_TEMPERATURE} \
+    --moe_router_jitter_noise ${MOE_ROUTER_JITTER_NOISE} \
+    --moe_fine_grained_factor ${MOE_FINE_GRAINED_FACTOR} \
+    --moe_num_shared_experts ${MOE_NUM_SHARED_EXPERTS} \
+    --moe_shared_expert_weight ${MOE_SHARED_EXPERT_WEIGHT} \
     > >(tee -a ${out}/${task_name}.log) 2> >(tee -a ${out}/${task_name}.err >&2)
 
-# available gpu
-array=(3 7)
-
-# total number of gpus
-nn=2
+IFS=',' read -r -a array <<< "${CUDA_VISIBLE_DEVICES}"
+nn=${NUM_GPUS}
 mkdir -p ./output_dir/${category}_base
 python src/utils/split.py --input_path $test_file \
         --output_path ./output_dir/${category}_base --nn ${nn}
@@ -44,8 +81,8 @@ do
         --result_json_data ./output_dir/${category}_base/${i}.json &
 done
 wait
+export CUDA_VISIBLE_DEVICES="${TRAIN_CUDA_VISIBLE_DEVICES}"
 python src/utils/merge.py --input_path ./output_dir/${category}_base/ \
         --output_path ${model_ckpt}/final_result.json --nn ${nn}
 python src/utils/calc.py --path ${model_ckpt}/final_result.json \
         --item_path ${info_file}
-

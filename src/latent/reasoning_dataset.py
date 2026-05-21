@@ -9,6 +9,7 @@ from tqdm import tqdm
 import os
 import copy
 import multiprocessing
+import ast
 
 
 
@@ -38,7 +39,7 @@ class Tokenizer:
 
     
 class LatentRDataset(Dataset):
-    def __init__(self, train_file, tokenizer, max_len=2048, sample=-1, test = False, seed=0, category="", K=4, dedup=False):
+    def __init__(self, train_file, tokenizer, max_len=2048, sample=-1, test = False, seed=0, category="", K=4, dedup=False, prompt_style="default"):
         self.data = pd.read_csv(train_file)
         random.seed(seed)
         
@@ -50,6 +51,7 @@ class LatentRDataset(Dataset):
         self.category = category
         self.K = K
         self.dedup = dedup
+        self.prompt_style = prompt_style
         self.instructs = [
         f"Given a list of {category} the user recetenly enjoy, please write a new {category} that the user may bought",
         f"Considering the {category} that has recently captured the user's interest, kindly create a compilation of other {category} that the user might have played prior to this.",
@@ -84,9 +86,28 @@ class LatentRDataset(Dataset):
 ### Response: 
 {data_point["output"]}"""
 
+    @staticmethod
+    def _parse_list(value):
+        if isinstance(value, list):
+            return value
+        if pd.isna(value):
+            return []
+        return ast.literal_eval(value)
+
+    @staticmethod
+    def _format_float(value):
+        return f"{float(value):.1f}"
+
+    @staticmethod
+    def _format_set(values):
+        return "{" + ", ".join(str(value) for value in values) + "}"
+
+    @staticmethod
+    def _format_title(title):
+        return str(title).replace("\\", "\\\\").replace('"', '\\"')
 
     def get_history(self, row):
-        row['history_item_title'] = eval(row['history_item_title'])
+        row['history_item_title'] = self._parse_list(row['history_item_title'])
         L = len(row['history_item_title']) 
         history = ""
         for i in range(L):
@@ -101,22 +122,81 @@ class LatentRDataset(Dataset):
         return {"input": f"The user has palyed the following {self.category}s before: {history}",
                 "output": target_item + '\n',
                 "dedup": target_item_id == last_history_item_id}
-    
-    def pre(self, idx):
+
+    def get_explicit_cot_history(self, row):
+        history_titles = self._parse_list(row["history_item_title"])
+        history_item_ids = self._parse_list(row["history_item_id"])
+        history_ratings = self._parse_list(row["history_rating"])
+        history_timestamps = self._parse_list(row["history_timestamp"])
+        target_timestamp = int(row["timestamp"])
+        target_item = "\"" + self._format_title(row["item_title"]) + "\""
+
+        lines = [
+            "Category: " + str(self.category),
+            "User interaction history (oldest -> newest):",
+        ]
+        dt_days = []
+        for idx, (item_id, title) in enumerate(zip(history_item_ids, history_titles), start=1):
+            rating = history_ratings[idx - 1] if idx - 1 < len(history_ratings) else row["rating"]
+            timestamp = history_timestamps[idx - 1] if idx - 1 < len(history_timestamps) else target_timestamp
+            days = max(0, int((target_timestamp - int(timestamp)) // 86400))
+            dt_days.append(days)
+            lines.append(
+                f'{idx}) [item_id={item_id}, dt_days={days}, rating={self._format_float(rating)}] '
+                f'title="{self._format_title(title)}"'
+            )
+
+        unique_item_ids = list(dict.fromkeys(history_item_ids))
+        repeat_cnt = len(history_item_ids) - len(unique_item_ids)
+        avg_rating = sum(float(rating) for rating in history_ratings) / max(1, len(history_ratings))
+        last_rating = history_ratings[-1] if history_ratings else row["rating"]
+
+        lines.extend(
+            [
+                "",
+                "### Explicit CoT:",
+                f"- L={len(history_item_ids)}, unique_cnt={len(unique_item_ids)}, repeat_cnt={repeat_cnt}",
+                f"- seen_item_ids={self._format_set(unique_item_ids)}",
+                f"- avg_rating={self._format_float(avg_rating)}, last_rating={self._format_float(last_rating)}",
+                f"- dt_days={dt_days}",
+                "- Constraint: output title NOT in seen_titles",
+                "",
+                "Task: Predict the next item the user will buy. Output exactly ONE candidate item title in double quotes.",
+            ]
+        )
+        return {
+            "input": "\n".join(lines),
+            "output": target_item + "\n",
+            "dedup": row["item_id"] in history_item_ids,
+        }
+
+    def generate_explicit_cot_prompt(self, data_point):
+        return f"""### User Input:
+{data_point["input"]}
+
+### Response:
+{data_point["output"]}"""
+
+    def build_prompt_and_target(self, idx):
+        if self.prompt_style == "explicit_cot":
+            history = self.get_explicit_cot_history(self.data.iloc[idx])
+            target_item = history["output"]
+            history["output"] = ""
+            return self.generate_explicit_cot_prompt(history), target_item
+
         instruction =  f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request. 
 
 ### Instruction:
 {self.instructs[0]}
 """
-        tokens = self.tokenizer.encode(instruction, bos=True, eos=False)
-
         history = self.get_history(self.data.iloc[idx])
         target_item = history['output']
         history['output'] = ''
-
-        prompt = self.generate_prompt(history)
-        tokens = tokens + self.tokenizer.encode(prompt, bos=False, eos=False)
-        history["input"] = ""
+        return instruction + self.generate_prompt(history), target_item
+    
+    def pre(self, idx):
+        prompt, target_item = self.build_prompt_and_target(idx)
+        tokens = self.tokenizer.encode(prompt, bos=True, eos=False)
 
         # add thought ids
         tokens = tokens + self.tokenizer.encode("<|Thought|>", bos=False, eos=False)
@@ -170,7 +250,10 @@ class LatentRDataset(Dataset):
     def get_all(self):
         temp = []
         for i in range(len(self.data)):
-            temp.append(self.get_history(self.data.iloc[i]))
+            if self.prompt_style == "explicit_cot":
+                temp.append(self.get_explicit_cot_history(self.data.iloc[i]))
+            else:
+                temp.append(self.get_history(self.data.iloc[i]))
         return temp
     
     def get_inputs_list(self):

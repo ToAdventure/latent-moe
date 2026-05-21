@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import inspect
 from typing import Union, Optional, Tuple
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from transformers import Qwen2ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+from latent_moe import build_latent_layer
 
 
 class VanillaRoPE(nn.Module):
@@ -140,7 +142,7 @@ class LatentModel(Qwen2ForCausalLM):
     def __init__(self, config):
         super().__init__(config)
         # self.mlp = Noise(config.hidden_size)
-        self.attention = SelfAttentionLayer(config.hidden_size)
+        self.attention = build_latent_layer(config, SelfAttentionLayer)
 
     def generate_embs(self, input_ids, attention_mask):
         output_mid = super().forward(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
@@ -171,7 +173,8 @@ class LatentModel(Qwen2ForCausalLM):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        num_logits_to_keep: int = 0,
+        logits_to_keep: Optional[int] = None,
+        num_logits_to_keep: Optional[int] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if input_ids is not None and inputs_embeds is None and input_ids.size() == attention_mask.size():
@@ -179,21 +182,30 @@ class LatentModel(Qwen2ForCausalLM):
             input_ids = None
         # elif input_ids is not None and inputs_embeds is None and input_ids.size()!=attention_mask.size():
             # 这个时候是在做生成任务，已经有了cache所以用input_ids即可
-        return super().forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            labels=labels,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-            num_logits_to_keep=num_logits_to_keep,
-            **kwargs,
-        )
+        cache_position = kwargs.pop("cache_position", cache_position)
+        logits_to_keep = kwargs.pop("logits_to_keep", logits_to_keep)
+        num_logits_to_keep = kwargs.pop("num_logits_to_keep", num_logits_to_keep)
+        requested_logits_to_keep = logits_to_keep if logits_to_keep is not None else num_logits_to_keep
+        requested_logits_to_keep = 0 if requested_logits_to_keep is None else requested_logits_to_keep
 
+        forward_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+            "inputs_embeds": inputs_embeds,
+            "labels": labels,
+            "use_cache": use_cache,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+            "return_dict": return_dict,
+        }
+        parent_params = inspect.signature(Qwen2ForCausalLM.forward).parameters
+        if "cache_position" in parent_params:
+            forward_kwargs["cache_position"] = cache_position
+        if "logits_to_keep" in parent_params:
+            forward_kwargs["logits_to_keep"] = requested_logits_to_keep
+        elif "num_logits_to_keep" in parent_params:
+            forward_kwargs["num_logits_to_keep"] = requested_logits_to_keep
 
-
+        return super().forward(**forward_kwargs, **kwargs)
