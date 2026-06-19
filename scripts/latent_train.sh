@@ -19,9 +19,22 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 : "${MOE_DROPOUT:=0.0}"
 : "${MOE_ROUTER_TEMPERATURE:=1.0}"
 : "${MOE_ROUTER_JITTER_NOISE:=0.0}"
+: "${MOE_LOAD_BALANCE_WEIGHT:=0.01}"
 : "${MOE_FINE_GRAINED_FACTOR:=2}"
 : "${MOE_NUM_SHARED_EXPERTS:=1}"
 : "${MOE_SHARED_EXPERT_WEIGHT:=1.0}"
+: "${LOAD_BEST_MODEL_AT_END:=true}"
+: "${SAVE_STRATEGY:=best}"
+: "${SAVE_TOTAL_LIMIT:=1}"
+: "${SAVE_ONLY_MODEL:=true}"
+: "${SAVE_FINAL_MODEL:=false}"
+: "${BEST_MODEL_METRIC:=hr5_ndcg5}"
+: "${METRIC_EVAL_SAMPLE:=-1}"
+: "${METRIC_EVAL_BATCH_SIZE:=4}"
+: "${METRIC_NUM_BEAMS:=10}"
+: "${METRIC_TOP_K:=5}"
+: "${METRIC_MAX_NEW_TOKENS:=128}"
+: "${METRIC_CUTOFF_LEN:=2560}"
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 TRAIN_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}"
 NUM_GPUS=$(( $(tr -cd ',' <<< "${CUDA_VISIBLE_DEVICES}" | wc -c) + 1 ))
@@ -46,18 +59,43 @@ mkdir -p ${out}
 echo "Using BASE_MODEL=${BASE_MODEL}"
 echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} with NUM_GPUS=${NUM_GPUS}"
 echo "Using LATENT_LAYER_TYPE=${LATENT_LAYER_TYPE}"
+echo "Using MOE_LOAD_BALANCE_WEIGHT=${MOE_LOAD_BALANCE_WEIGHT}"
+echo "Using LOAD_BEST_MODEL_AT_END=${LOAD_BEST_MODEL_AT_END}"
+echo "Using SAVE_STRATEGY=${SAVE_STRATEGY}"
+echo "Using SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT}"
+echo "Using SAVE_ONLY_MODEL=${SAVE_ONLY_MODEL}"
+echo "Using SAVE_FINAL_MODEL=${SAVE_FINAL_MODEL}"
+echo "Using BEST_MODEL_METRIC=${BEST_MODEL_METRIC}"
+echo "Using METRIC_EVAL_SAMPLE=${METRIC_EVAL_SAMPLE}"
+echo "Using METRIC_EVAL_BATCH_SIZE=${METRIC_EVAL_BATCH_SIZE}"
+echo "Using METRIC_NUM_BEAMS=${METRIC_NUM_BEAMS}"
+echo "Using METRIC_TOP_K=${METRIC_TOP_K}"
 torchrun --nproc_per_node=${NUM_GPUS} --nnodes=1 --master_port=$port \
     src/latent/latent_attention_train.py \
     --base_model $BASE_MODEL \
     --train_file ${train_file} --eval_file ${eval_file} \
     --output_dir ${out} --category ${category} --sample -1 \
     --latent_layer_type ${LATENT_LAYER_TYPE} \
+    --load_best_model_at_end "${LOAD_BEST_MODEL_AT_END}" \
+    --save_strategy "${SAVE_STRATEGY}" \
+    --save_total_limit "${SAVE_TOTAL_LIMIT}" \
+    --save_only_model "${SAVE_ONLY_MODEL}" \
+    --save_final_model "${SAVE_FINAL_MODEL}" \
+    --best_model_metric "${BEST_MODEL_METRIC}" \
+    --metric_info_file "${info_file}" \
+    --metric_eval_sample "${METRIC_EVAL_SAMPLE}" \
+    --metric_eval_batch_size "${METRIC_EVAL_BATCH_SIZE}" \
+    --metric_num_beams "${METRIC_NUM_BEAMS}" \
+    --metric_top_k "${METRIC_TOP_K}" \
+    --metric_max_new_tokens "${METRIC_MAX_NEW_TOKENS}" \
+    --metric_cutoff_len "${METRIC_CUTOFF_LEN}" \
     --moe_num_experts ${MOE_NUM_EXPERTS} --moe_top_k ${MOE_TOP_K} \
     --moe_expert_hidden_size ${MOE_EXPERT_HIDDEN_SIZE} \
     --moe_expert_hidden_multiplier ${MOE_EXPERT_HIDDEN_MULTIPLIER} \
     --moe_dropout ${MOE_DROPOUT} \
     --moe_router_temperature ${MOE_ROUTER_TEMPERATURE} \
     --moe_router_jitter_noise ${MOE_ROUTER_JITTER_NOISE} \
+    --moe_load_balance_weight ${MOE_LOAD_BALANCE_WEIGHT} \
     --moe_fine_grained_factor ${MOE_FINE_GRAINED_FACTOR} \
     --moe_num_shared_experts ${MOE_NUM_SHARED_EXPERTS} \
     --moe_shared_expert_weight ${MOE_SHARED_EXPERT_WEIGHT} \
@@ -69,7 +107,48 @@ mkdir -p ./output_dir/${category}_base
 python src/utils/split.py --input_path $test_file \
         --output_path ./output_dir/${category}_base --nn ${nn}
 
-model_ckpt=./output_dir/${category}/latent
+select_model_ckpt() {
+    python - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+out_abs = out.resolve()
+
+def existing_checkpoint(raw):
+    if not raw:
+        return None
+    p = Path(raw)
+    candidates = [p]
+    if not p.is_absolute():
+        candidates.extend([Path.cwd() / p, out_abs / p.name])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+states = sorted(out.glob("checkpoint-*/trainer_state.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+for state_path in states:
+    try:
+        state = json.loads(state_path.read_text())
+    except Exception:
+        continue
+    best = existing_checkpoint(state.get("best_model_checkpoint"))
+    if best is not None:
+        print(best)
+        raise SystemExit(0)
+
+if states:
+    print(states[0].parent.resolve())
+else:
+    print(out_abs)
+PY
+}
+
+out=./output_dir/${category}/latent
+model_ckpt="$(select_model_ckpt "${out}")"
+echo "Using model checkpoint for eval: ${model_ckpt}"
 for (( i=0; i<$nn; i++ ))
 do
     export CUDA_VISIBLE_DEVICES=${array[$i]}
@@ -83,6 +162,6 @@ done
 wait
 export CUDA_VISIBLE_DEVICES="${TRAIN_CUDA_VISIBLE_DEVICES}"
 python src/utils/merge.py --input_path ./output_dir/${category}_base/ \
-        --output_path ${model_ckpt}/final_result.json --nn ${nn}
-python src/utils/calc.py --path ${model_ckpt}/final_result.json \
+        --output_path ${out}/final_result.json --nn ${nn}
+python src/utils/calc.py --path ${out}/final_result.json \
         --item_path ${info_file}

@@ -22,6 +22,7 @@ export BASE_MODEL="${BASE_MODEL:-/data/gtq/latent-moe/models/Qwen2.5-1.5B}"
 export LATENT_LAYER_TYPE="${LATENT_LAYER_TYPE:-attention}"
 export LATENT_EXPERIMENT_NAME="${LATENT_EXPERIMENT_NAME:-explicit_cot_prompt}"
 export PROMPT_STYLE="explicit_cot"
+export CUTOFF_LEN="${CUTOFF_LEN:-0}"
 
 mkdir -p ./logs
 TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
@@ -44,6 +45,7 @@ log "Base model           : $BASE_MODEL"
 log "Latent layer type    : $LATENT_LAYER_TYPE"
 log "Experiment name      : $LATENT_EXPERIMENT_NAME"
 log "Prompt style         : $PROMPT_STYLE"
+log "Cutoff len           : $CUTOFF_LEN (<=0 disables train/valid truncation)"
 log "Log file             : $LOG_FILE"
 log "Start time           : $(date '+%Y-%m-%d %H:%M:%S')"
 

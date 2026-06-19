@@ -7,6 +7,14 @@ def configure_fsdp2_environment(
     state_dict_type: str = "FULL_STATE_DICT",
 ) -> None:
     if not enabled:
+        for key in (
+            "ACCELERATE_USE_FSDP",
+            "FSDP_VERSION",
+            "FSDP_RESHARD_AFTER_FORWARD",
+            "FSDP_STATE_DICT_TYPE",
+            "FSDP_CPU_RAM_EFFICIENT_LOADING",
+        ):
+            os.environ.pop(key, None)
         return
 
     # Transformers does not propagate fsdp_version from TrainingArguments to

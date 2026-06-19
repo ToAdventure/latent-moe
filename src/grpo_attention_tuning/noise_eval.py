@@ -2,6 +2,7 @@ import sys
 import os
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
+sys.path.insert(0, os.path.dirname(current_dir))
 import pandas as pd
 import fire
 import torch
@@ -40,8 +41,7 @@ def main(
                      "Pet_Supplies": "pet supplies", "Arts_Crafts_and_Sewing": "arts products", "STEAM": "games", "Movies": "movie",
                      "yelp": "resturant"}
     category = category_dict[category]
-    model = LatentModel.from_pretrained(base_model, torch_dtype=torch.bfloat16,
-                                        use_flash_attention_2=True if base_model.lower().find("llama") > -1 else False)
+    model = LatentModel.from_pretrained(base_model, torch_dtype=torch.bfloat16)
     model.attention.end_k = end_k
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     tokenizer.pad_token = tokenizer.eos_token
@@ -170,5 +170,4 @@ def main(
 
 if __name__ == '__main__':
     fire.Fire(main)
-
 

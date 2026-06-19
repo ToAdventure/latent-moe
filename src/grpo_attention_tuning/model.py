@@ -193,7 +193,17 @@ class LatentModel(Qwen2ForCausalLM):
         elif "num_logits_to_keep" in parent_params:
             forward_kwargs["num_logits_to_keep"] = requested_logits_to_keep
 
-        return super().forward(**forward_kwargs, **kwargs)
+        model_output = super().forward(**forward_kwargs, **kwargs)
+        load_balance_loss = getattr(self.attention, "load_balance_loss", None)
+        if (
+            self.training
+            and labels is not None
+            and load_balance_loss is not None
+            and model_output.loss is not None
+        ):
+            model_output.loss = model_output.loss + load_balance_loss.to(model_output.loss.device)
+
+        return model_output
 
 
 # class NoisyLatentModel(LatentModel):

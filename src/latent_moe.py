@@ -35,6 +35,7 @@ def set_latent_layer_config(
     moe_fine_grained_factor=2,
     moe_num_shared_experts=1,
     moe_shared_expert_weight=1.0,
+    moe_load_balance_weight=0.01,
 ):
     latent_layer_type = resolve_latent_layer_type(config, latent_layer_type)
     config.latent_layer_type = latent_layer_type
@@ -49,6 +50,7 @@ def set_latent_layer_config(
     config.moe_fine_grained_factor = _positive_int(moe_fine_grained_factor, "moe_fine_grained_factor")
     config.moe_num_shared_experts = int(moe_num_shared_experts)
     config.moe_shared_expert_weight = float(moe_shared_expert_weight)
+    config.moe_load_balance_weight = float(moe_load_balance_weight)
     return config
 
 
@@ -115,6 +117,7 @@ class TopKMoELayer(MaskedContextMixin, nn.Module):
         dropout=0.0,
         router_temperature=1.0,
         router_jitter_noise=0.0,
+        load_balance_weight=0.01,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -123,6 +126,8 @@ class TopKMoELayer(MaskedContextMixin, nn.Module):
         self.top_k = min(_positive_int(top_k, "top_k"), self.num_experts)
         self.router_temperature = max(float(router_temperature), 1e-6)
         self.router_jitter_noise = float(router_jitter_noise)
+        self.load_balance_weight = float(load_balance_weight)
+        self.load_balance_loss = None
         expert_size = _expert_hidden_size(hidden_size, expert_hidden_size, expert_hidden_multiplier)
 
         self.router = nn.Linear(hidden_size, self.num_experts, bias=False)
@@ -130,15 +135,29 @@ class TopKMoELayer(MaskedContextMixin, nn.Module):
             [FeedForwardExpert(hidden_size, expert_size, dropout=dropout) for _ in range(self.num_experts)]
         )
 
+    def switch_load_balancing_loss(self, router_probs, top_indices):
+        if self.load_balance_weight <= 0 or router_probs.numel() == 0:
+            return router_probs.new_zeros(())
+
+        selected_mask = F.one_hot(top_indices, num_classes=self.num_experts).to(router_probs.dtype)
+        tokens_per_expert = selected_mask.mean(dim=tuple(range(selected_mask.dim() - 1))).detach()
+        router_prob_per_expert = router_probs.mean(dim=0)
+        loss = self.num_experts * torch.sum(tokens_per_expert * router_prob_per_expert)
+        return loss * self.load_balance_weight
+
     def forward(self, hidden_states, attention_mask, thought_id_idx):
+        self.load_balance_loss = None
         context = self.pool_context(hidden_states, attention_mask, thought_id_idx)
         router_logits = self.router(context)
         if self.training and self.router_jitter_noise > 0:
             router_logits = router_logits + torch.randn_like(router_logits) * self.router_jitter_noise
 
-        router_scores = F.softmax(router_logits.float() / self.router_temperature, dim=-1).to(context.dtype)
-        top_scores, top_indices = torch.topk(router_scores, k=self.top_k, dim=-1)
+        router_probs = F.softmax(router_logits.float() / self.router_temperature, dim=-1)
+        top_scores, top_indices = torch.topk(router_probs, k=self.top_k, dim=-1)
+        top_scores = top_scores.to(context.dtype)
         top_scores = top_scores / top_scores.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        if self.training:
+            self.load_balance_loss = self.switch_load_balancing_loss(router_probs, top_indices)
 
         expert_outputs = torch.stack([expert(context) for expert in self.experts], dim=1)
         gather_indices = top_indices.unsqueeze(-1).expand(-1, -1, self.hidden_size)
@@ -161,6 +180,7 @@ class DeepSeekMoELayer(TopKMoELayer):
         fine_grained_factor=2,
         num_shared_experts=1,
         shared_expert_weight=1.0,
+        load_balance_weight=0.01,
     ):
         self.base_num_experts = _positive_int(num_experts, "num_experts")
         self.fine_grained_factor = _positive_int(fine_grained_factor, "fine_grained_factor")
@@ -182,6 +202,8 @@ class DeepSeekMoELayer(TopKMoELayer):
         self.top_k = routed_top_k
         self.router_temperature = max(float(router_temperature), 1e-6)
         self.router_jitter_noise = float(router_jitter_noise)
+        self.load_balance_weight = float(load_balance_weight)
+        self.load_balance_loss = None
         self.router = nn.Linear(hidden_size, self.num_experts, bias=False)
         self.experts = nn.ModuleList(
             [FeedForwardExpert(hidden_size, expert_size, dropout=dropout) for _ in range(self.num_experts)]
@@ -216,6 +238,7 @@ def build_latent_layer(config, attention_cls):
             dropout=getattr(config, "moe_dropout", 0.0),
             router_temperature=getattr(config, "moe_router_temperature", 1.0),
             router_jitter_noise=getattr(config, "moe_router_jitter_noise", 0.0),
+            load_balance_weight=getattr(config, "moe_load_balance_weight", 0.0),
         )
     if layer_type == "deepseek_moe":
         return DeepSeekMoELayer(
@@ -231,5 +254,6 @@ def build_latent_layer(config, attention_cls):
             fine_grained_factor=getattr(config, "moe_fine_grained_factor", 2),
             num_shared_experts=getattr(config, "moe_num_shared_experts", 1),
             shared_expert_weight=getattr(config, "moe_shared_expert_weight", 1.0),
+            load_balance_weight=getattr(config, "moe_load_balance_weight", 0.0),
         )
     raise ValueError(f"Unsupported latent_layer_type: {layer_type}")

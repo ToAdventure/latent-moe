@@ -47,7 +47,9 @@ class LatentRDataset(Dataset):
             self.data = self.data.sample(sample, random_state=seed)
         self.tokenizer = Tokenizer(tokenizer)
         self.test = test
-        self.max_len = max_len
+        self.max_len = int(max_len) if max_len is not None else None
+        if self.max_len is not None and self.max_len <= 0:
+            self.max_len = None
         self.category = category
         self.K = K
         self.dedup = dedup
@@ -142,7 +144,7 @@ class LatentRDataset(Dataset):
             days = max(0, int((target_timestamp - int(timestamp)) // 86400))
             dt_days.append(days)
             lines.append(
-                f'{idx}) [item_id={item_id}, dt_days={days}, rating={self._format_float(rating)}] '
+                f'{idx} [item_id={item_id}, dt_days={days}, rating={self._format_float(rating)}] '
                 f'title="{self._format_title(title)}"'
             )
 
@@ -159,7 +161,6 @@ class LatentRDataset(Dataset):
                 f"- seen_item_ids={self._format_set(unique_item_ids)}",
                 f"- avg_rating={self._format_float(avg_rating)}, last_rating={self._format_float(last_rating)}",
                 f"- dt_days={dt_days}",
-                "- Constraint: output title NOT in seen_titles",
                 "",
                 "Task: Predict the next item the user will buy. Output exactly ONE candidate item title in double quotes.",
             ]
@@ -171,7 +172,12 @@ class LatentRDataset(Dataset):
         }
 
     def generate_explicit_cot_prompt(self, data_point):
-        return f"""### User Input:
+        instruction = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+{self.instructs[0]}
+"""
+        return instruction + f"""### User Input:
 {data_point["input"]}
 
 ### Response:
@@ -220,14 +226,18 @@ class LatentRDataset(Dataset):
         attention_mask = [1] * len(tokens)
         labels = [-100] * input_prompt_len + tokens[input_prompt_len:]
         
-        if len(tokens) >= self.max_len:
+        if self.max_len is not None and len(tokens) >= self.max_len:
             print(len(tokens))
-        
-        
+
+        if self.max_len is not None:
+            tokens = tokens[-self.max_len:]
+            attention_mask = attention_mask[-self.max_len:]
+            labels = labels[-self.max_len:]
+
         return {
-            "input_ids": tokens[-self.max_len:],
-            "attention_mask": attention_mask[-self.max_len:],
-            "labels": labels[-self.max_len:],
+            "input_ids": tokens,
+            "attention_mask": attention_mask,
+            "labels": labels,
             
         }
     

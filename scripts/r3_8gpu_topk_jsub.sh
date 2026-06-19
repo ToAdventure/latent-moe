@@ -20,19 +20,23 @@ export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 export BASE_MODEL="${BASE_MODEL:-/data/gtq/latent-moe/models/Qwen2.5-1.5B}"
 
 export LATENT_LAYER_TYPE="topk_moe"
-export LATENT_EXPERIMENT_NAME="${LATENT_EXPERIMENT_NAME:-topk_moe}"
-export PROMPT_STYLE="${PROMPT_STYLE:-default}"
+export LATENT_EXPERIMENT_NAME="topk_moe_loss"
+export PROMPT_STYLE="default"
+export CUTOFF_LEN="512"
 export MOE_NUM_EXPERTS="${MOE_NUM_EXPERTS:-4}"
 export MOE_TOP_K="${MOE_TOP_K:-2}"
 export MOE_EXPERT_HIDDEN_SIZE="${MOE_EXPERT_HIDDEN_SIZE:-0}"
 export MOE_EXPERT_HIDDEN_MULTIPLIER="${MOE_EXPERT_HIDDEN_MULTIPLIER:-1.0}"
-export MOE_DROPOUT="${MOE_DROPOUT:-0.0}"
+export MOE_DROPOUT="${MOE_DROPOUT:-0.05}"
 export MOE_ROUTER_TEMPERATURE="${MOE_ROUTER_TEMPERATURE:-1.0}"
 export MOE_ROUTER_JITTER_NOISE="${MOE_ROUTER_JITTER_NOISE:-0.0}"
+export MOE_LOAD_BALANCE_WEIGHT="${MOE_LOAD_BALANCE_WEIGHT:-0.01}"
 
 mkdir -p ./logs
 TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
-LOG_FILE="./logs/r3_8gpu_topk_moe_four_datasets_${TIMESTAMP}.log"
+RUN_DATASET_LABEL="${LATENT_CATEGORIES:-four_datasets}"
+RUN_DATASET_LABEL="${RUN_DATASET_LABEL// /_}"
+LOG_FILE="./logs/r3_8gpu_topk_moe_loss_${RUN_DATASET_LABEL}_${TIMESTAMP}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -43,16 +47,19 @@ section() {
     echo "============================================================"
 }
 
-section "R3 8-GPU Top-K MoE Four-Dataset JSUB Job"
+section "R3 8-GPU Top-K MoE ${RUN_DATASET_LABEL} JSUB Job"
 log "Host                 : $(hostname)"
 log "Work directory       : $SCRIPT_DIR"
 log "CUDA_VISIBLE_DEVICES : $CUDA_VISIBLE_DEVICES"
 log "Base model           : $BASE_MODEL"
 log "Latent layer type    : $LATENT_LAYER_TYPE"
 log "Experiment name      : $LATENT_EXPERIMENT_NAME"
+log "Datasets             : ${LATENT_CATEGORIES:-CDs_and_Vinyl Musical_Instruments Toys_and_Games Video_Games}"
 log "Prompt style         : $PROMPT_STYLE"
+log "Cutoff len           : $CUTOFF_LEN"
 log "MOE_NUM_EXPERTS      : $MOE_NUM_EXPERTS"
 log "MOE_TOP_K            : $MOE_TOP_K"
+log "MOE_LOAD_BALANCE_WT  : $MOE_LOAD_BALANCE_WEIGHT"
 log "Log file             : $LOG_FILE"
 log "Start time           : $(date '+%Y-%m-%d %H:%M:%S')"
 

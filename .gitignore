@@ -9,6 +9,11 @@ logs/
 output_dir/
 error.*
 output.*
+*.log
+*.tar
+*_loss_curve.png
+*_loss_points.csv
+tmp_parallel_check/
 
 # Local model weights
 models/

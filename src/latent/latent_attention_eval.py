@@ -3,6 +3,7 @@ import sys
 import os
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
+sys.path.insert(0, os.path.dirname(current_dir))
 import torch
 import json
 from transformers import GenerationConfig,  AutoTokenizer
@@ -36,7 +37,7 @@ def main(
                      "yelp": "resturant" }
     category = category_dict[category]
 
-    model = LatentModel.from_pretrained(base_model, torch_dtype=torch.bfloat16, use_flash_attention_2=False)
+    model = LatentModel.from_pretrained(base_model, torch_dtype=torch.bfloat16)
     model.attention.end_k = end_k
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
@@ -143,9 +144,6 @@ def main(
     seq_scores = []
     for idx, encodings in enumerate(tqdm(new_encodings)):
         output, score, seq_score = evaluate(encodings, cf_logits=None, temperature=temperature, guidance_scale=guidance_scale, length_penalty=length_penalty)
-        if idx == 0:
-            print(output)
-            print(score)
         outputs = outputs + output
         scores = scores + score
         seq_scores.append(seq_score)
@@ -164,7 +162,4 @@ def main(
 
 if __name__ == '__main__':
     fire.Fire(main)
-
-
-
 
