@@ -25,7 +25,10 @@ except ImportError:
 def normalize_title(value):
     if isinstance(value, list):
         value = value[0] if value else ""
-    return str(value).strip(" \n").strip("\"").strip(" ")
+    text = str(value).strip(" \n")
+    if text.startswith(":"):
+        text = text[1:].strip(" \n")
+    return text.strip("\"").strip(" ")
 
 
 def compute_hr_ndcg_at_k(records, item_names, top_k):
@@ -59,6 +62,38 @@ def compute_hr_ndcg_at_k(records, item_names, top_k):
         "num_generation_eval_samples": len(records),
         "unknown_generation_predictions": unknown_predictions,
     }
+
+
+def parse_top_ks(value, default_top_k=None):
+    if value is None or value == "":
+        if default_top_k is None:
+            return []
+        return [int(default_top_k)]
+    if isinstance(value, int):
+        return [int(value)]
+    if isinstance(value, (list, tuple)):
+        top_ks = [int(_) for _ in value]
+    else:
+        top_ks = [int(_) for _ in str(value).replace(";", ",").split(",") if str(_).strip()]
+    top_ks = sorted(set(top_ks))
+    if any(_ <= 0 for _ in top_ks):
+        raise ValueError(f"top-k values must be positive, got {value!r}")
+    return top_ks
+
+
+def first_eos_mask(ids, eos_token_id):
+    mask = torch.ones_like(ids, dtype=torch.long)
+    if eos_token_id is None:
+        return mask
+    eos = ids.eq(eos_token_id)
+    has_eos = eos.any(dim=1)
+    if not has_eos.any():
+        return mask
+    first = eos.float().argmax(dim=1)
+    positions = torch.arange(ids.size(1), device=ids.device).unsqueeze(0)
+    after_eos = positions > first.unsqueeze(1)
+    mask = mask.masked_fill(has_eos.unsqueeze(1) & after_eos, 0)
+    return mask
 
 
 def swap_adjacent_blocks(x, k):
@@ -125,6 +160,15 @@ class NoiseGRPORecTrainer(GRPOTrainer):
         reward_w_soft=0.5,
         reward_w_margin=0.5,
         reward_w_logp=0.05,
+        reward_backend="auto",
+        flr_reward_w_logp=0.1,
+        flr_reward_w_exact=1.0,
+        listwise_negative_strategy="random",
+        listwise_hard_negative_pool_size=64,
+        on_policy_num_beams=1,
+        on_policy_temperature=1.0,
+        on_policy_reward_top_ks="5,10",
+        discard_zero_advantage_groups=True,
         noise_std=1.0,
         generation_metric_config=None,
         generation_metric_dataset=None,
@@ -135,7 +179,20 @@ class NoiseGRPORecTrainer(GRPOTrainer):
         **kwargs,
     ) -> None:
         self.info_file = info_file
-        self.use_listwise_reward = use_listwise_reward
+        reward_backend = str(reward_backend).strip().lower()
+        if reward_backend in ("", "auto", "none"):
+            reward_backend = "listwise" if use_listwise_reward else "ppl"
+        if reward_backend == "generation":
+            reward_backend = "on_policy"
+        if reward_backend not in ("listwise", "flr", "ppl", "on_policy"):
+            raise ValueError(
+                "reward_backend must be one of {'auto', 'listwise', 'flr', 'ppl', 'on_policy'}, "
+                f"got {reward_backend!r}"
+            )
+        self.reward_backend = reward_backend
+        self.use_listwise_reward = self.reward_backend == "listwise"
+        self.use_on_policy_reward = self.reward_backend == "on_policy"
+        self.uses_grouped_reward = self.reward_backend in ("listwise", "flr", "on_policy")
         self.num_listwise_negatives = num_listwise_negatives
         self.listwise_candidate_chunk_size = int(listwise_candidate_chunk_size)
         if self.listwise_candidate_chunk_size <= 0:
@@ -149,6 +206,25 @@ class NoiseGRPORecTrainer(GRPOTrainer):
         self.reward_w_soft = reward_w_soft
         self.reward_w_margin = reward_w_margin
         self.reward_w_logp = reward_w_logp
+        self.flr_reward_w_logp = flr_reward_w_logp
+        self.flr_reward_w_exact = flr_reward_w_exact
+        self.listwise_negative_strategy = str(listwise_negative_strategy).strip().lower()
+        if self.listwise_negative_strategy not in ("random", "hard", "mixed"):
+            raise ValueError(
+                "listwise_negative_strategy must be one of {'random', 'hard', 'mixed'}, "
+                f"got {listwise_negative_strategy!r}"
+            )
+        self.listwise_hard_negative_pool_size = int(listwise_hard_negative_pool_size)
+        if self.listwise_hard_negative_pool_size <= 0:
+            raise ValueError(
+                "listwise_hard_negative_pool_size must be positive, "
+                f"got {listwise_hard_negative_pool_size}"
+            )
+        self.on_policy_num_beams = max(1, int(on_policy_num_beams))
+        self.on_policy_temperature = max(float(on_policy_temperature), 1e-6)
+        self.on_policy_reward_top_ks = parse_top_ks(on_policy_reward_top_ks, default_top_k=10)
+        self.on_policy_reward_top_k = max(self.on_policy_reward_top_ks)
+        self.discard_zero_advantage_groups = bool(discard_zero_advantage_groups)
         self.noise_std = noise_std
         self.generation_metric_config = generation_metric_config
         self.generation_metric_dataset = generation_metric_dataset
@@ -231,12 +307,25 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             for part in gathered:
                 records.extend(part)
             records.sort(key=lambda record: record["index"])
-            metrics = compute_hr_ndcg_at_k(
-                records,
-                self.generation_metric_item_names,
-                int(config["top_k"]),
-            )
-            metrics["generation_best_metric"] = metrics[f"hr{config['top_k']}_ndcg{config['top_k']}"]
+            top_ks = config.get("top_ks") or [int(config["top_k"])]
+            metrics = {}
+            for top_k in top_ks:
+                metrics.update(
+                    compute_hr_ndcg_at_k(
+                        records,
+                        self.generation_metric_item_names,
+                        int(top_k),
+                    )
+                )
+            if len(top_ks) == 1:
+                top_k = int(top_ks[0])
+                metrics["generation_best_metric"] = metrics[f"hr{top_k}_ndcg{top_k}"]
+            else:
+                pair_scores = [
+                    metrics[f"hr{int(top_k)}_ndcg{int(top_k)}"]
+                    for top_k in top_ks
+                ]
+                metrics["generation_best_metric"] = sum(pair_scores) / len(pair_scores)
             self.append_generation_metric_history(metrics)
         else:
             metrics = None
@@ -347,7 +436,7 @@ class NoiseGRPORecTrainer(GRPOTrainer):
                         {
                             "index": int(sample_idx),
                             "target": raw_data[sample_idx]["output"],
-                            "predict": grouped[row_idx][:int(config["top_k"])],
+                            "predict": grouped[row_idx][:return_sequences],
                         }
                     )
 
@@ -390,7 +479,7 @@ class NoiseGRPORecTrainer(GRPOTrainer):
     def _get_train_sampler(self, train_dataset=None):
         if train_dataset is None:
             train_dataset = self.train_dataset
-        if train_dataset is None or not self.use_listwise_reward:
+        if train_dataset is None or not self.uses_grouped_reward:
             return super()._get_train_sampler()
         return GroupedRandomSampler(
             train_dataset,
@@ -433,13 +522,14 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             )
         return where_thought_ids[:, 1]
 
-    def _sample_negative_candidate_ids(self, positive_ids, device):
+    def _sample_negative_candidate_ids(self, positive_ids, device, count=None):
+        count = self.num_listwise_negatives if count is None else int(count)
         positive_tuple = tuple(positive_ids)
         negatives = []
         seen = {positive_tuple}
-        max_tries = max(self.num_listwise_negatives * 20, self.num_listwise_negatives + 1)
+        max_tries = max(count * 20, count + 1)
         tries = 0
-        while len(negatives) < self.num_listwise_negatives and tries < max_tries:
+        while len(negatives) < count and tries < max_tries:
             tries += 1
             idx = torch.randint(0, len(self.catalog_candidate_ids), (1,), device=device).item()
             candidate = self.catalog_candidate_ids[idx]
@@ -449,6 +539,15 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             seen.add(candidate_tuple)
             negatives.append(candidate)
         return negatives
+
+    def _select_hard_negative_scores(self, scores, num_negatives):
+        neg_scores = scores[:, 1:]
+        if neg_scores.size(1) <= num_negatives:
+            return scores
+        mean_scores = neg_scores.mean(dim=0)
+        top_indices = torch.topk(mean_scores, k=num_negatives, largest=True).indices
+        selected_neg_scores = neg_scores.index_select(dim=1, index=top_indices)
+        return torch.cat([scores[:, :1], selected_neg_scores], dim=1)
 
     @torch.no_grad()
     def _score_candidate_set(
@@ -472,16 +571,40 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             group_end = group_start + self.num_generations
             pos_mask = positive_completion_mask[group_start].bool()
             pos_ids = positive_completion_ids[group_start][pos_mask].tolist()
-            negs = self._sample_negative_candidate_ids(pos_ids, device)
-            candidate_lists = [pos_ids] + negs
-            all_scores.append(
-                self._score_shared_candidates(
+            if self.listwise_negative_strategy == "random":
+                negs = self._sample_negative_candidate_ids(pos_ids, device)
+                candidate_lists = [pos_ids] + negs
+                scores = self._score_shared_candidates(
                     prompt_ids=prompt_ids[group_start:group_end],
                     prompt_mask=prompt_mask[group_start:group_end],
                     noise=noise[group_start:group_end],
                     candidate_lists=candidate_lists,
                 )
-            )
+            else:
+                pool_size = max(self.listwise_hard_negative_pool_size, self.num_listwise_negatives)
+                pool_negs = self._sample_negative_candidate_ids(pos_ids, device, count=pool_size)
+                candidate_lists = [pos_ids] + pool_negs
+                pool_scores = self._score_shared_candidates(
+                    prompt_ids=prompt_ids[group_start:group_end],
+                    prompt_mask=prompt_mask[group_start:group_end],
+                    noise=noise[group_start:group_end],
+                    candidate_lists=candidate_lists,
+                )
+                hard_scores = self._select_hard_negative_scores(pool_scores, self.num_listwise_negatives)
+                if self.listwise_negative_strategy == "mixed" and pool_scores.size(1) > 1:
+                    random_scores = pool_scores[:, 1:1 + self.num_listwise_negatives]
+                    half = max(1, self.num_listwise_negatives // 2)
+                    scores = torch.cat(
+                        [
+                            pool_scores[:, :1],
+                            hard_scores[:, 1:1 + half],
+                            random_scores[:, : self.num_listwise_negatives - half],
+                        ],
+                        dim=1,
+                    )
+                else:
+                    scores = hard_scores
+            all_scores.append(scores)
         return torch.cat(all_scores, dim=0)
 
     @torch.no_grad()
@@ -603,6 +726,126 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             "margin_reward": margin_reward,
         }
 
+    def _compute_flr_reward(self, old_per_token_logps, completion_ids, pred_ids, labels_length):
+        avg_logp = old_per_token_logps.clone().sum(dim=-1) / labels_length
+        seq_exact = (pred_ids == completion_ids).all(dim=-1).float()
+        reward_logp = self.flr_reward_w_logp * avg_logp
+        reward_exact = self.flr_reward_w_exact * seq_exact
+        reward = reward_logp + reward_exact
+        return reward.to(torch.float32), {
+            "avg_logp": avg_logp,
+            "seq_exact": seq_exact,
+            "reward_logp": reward_logp,
+            "reward_exact": reward_exact,
+        }
+
+    def _decode_generation_titles(self, completion_ids, completion_mask=None):
+        rows = completion_ids.detach().cpu().tolist()
+        if completion_mask is not None:
+            masks = completion_mask.detach().cpu().tolist()
+            rows = [
+                [token for token, keep in zip(row, mask) if keep]
+                for row, mask in zip(rows, masks)
+            ]
+        decoded = self.processing_class.batch_decode(
+            rows,
+            skip_special_tokens=True,
+        )
+        return [normalize_title(text.split("Response:")[-1]) for text in decoded]
+
+    def _compute_on_policy_reward(self, completion_ids, target_completion_ids, target_mask, sequence_scores):
+        batch_size = completion_ids.size(0)
+        if batch_size % self.num_generations != 0:
+            raise ValueError(
+                f"on_policy reward expects batch_size divisible by num_generations, "
+                f"got batch_size={batch_size}, num_generations={self.num_generations}"
+            )
+
+        pred_titles = self._decode_generation_titles(completion_ids)
+        target_titles = self._decode_generation_titles(target_completion_ids, target_mask)
+        rewards = torch.zeros(batch_size, device=completion_ids.device, dtype=torch.float32)
+        hits = torch.zeros(batch_size, device=completion_ids.device, dtype=torch.float32)
+        ranks = torch.full((batch_size,), float(self.on_policy_reward_top_k + 1), device=completion_ids.device)
+
+        for group_start in range(0, batch_size, self.num_generations):
+            group_end = group_start + self.num_generations
+            group_scores = sequence_scores[group_start:group_end]
+            order = torch.argsort(group_scores, descending=True).tolist()
+            target = target_titles[group_start]
+            for rank_pos, local_idx in enumerate(order):
+                row = group_start + local_idx
+                if pred_titles[row] != target:
+                    continue
+                one_based_rank = rank_pos + 1
+                ranks[row] = float(one_based_rank)
+                hits[row] = 1.0
+                topk_rewards = [
+                    1.0 / math.log2(one_based_rank + 1.0)
+                    for top_k in self.on_policy_reward_top_ks
+                    if one_based_rank <= top_k
+                ]
+                if topk_rewards:
+                    rewards[row] = sum(topk_rewards) / len(self.on_policy_reward_top_ks)
+
+        return rewards, {
+            "hit": hits,
+            "rank": ranks,
+            "sequence_score": sequence_scores.detach(),
+            "reward": rewards.detach(),
+        }
+
+    @torch.no_grad()
+    def _generate_on_policy_completion_ids(self, prompt_ids, prompt_mask):
+        generation_model = self._unwrap_latent_model()
+        model_config = getattr(generation_model, "config", None)
+        if model_config is None:
+            raise ValueError("On-policy generation requires a model config.")
+
+        was_training = generation_model.training
+        generation_model.eval()
+        generation_config = GenerationConfig(
+            num_beams=self.on_policy_num_beams,
+            do_sample=True,
+            temperature=self.on_policy_temperature,
+            num_return_sequences=1,
+            pad_token_id=model_config.pad_token_id,
+            eos_token_id=model_config.eos_token_id,
+            max_new_tokens=self.max_completion_length,
+        )
+        ccc = CFEnhancedLogitsProcessor(
+            guidance_scale=1.0,
+            cf_logits=None,
+            prefix_allowed_tokens_fn=self.prefix_allowed_tokens_fn,
+            cf_dict=None,
+            unconditional_ids=None,
+            model=generation_model,
+            tokenizer=self.processing_class,
+            num_beams=self.on_policy_num_beams,
+        )
+        logits_processor = LogitsProcessorList([ccc])
+        generation_output = generation_model.generate(
+            prompt_ids,
+            generation_config=generation_config,
+            return_dict_in_generate=True,
+            output_scores=False,
+            logits_processor=logits_processor,
+            attention_mask=prompt_mask,
+            synced_gpus=self.args.world_size > 1,
+        )
+        if was_training:
+            generation_model.train()
+
+        completion_ids = generation_output.sequences[:, prompt_ids.size(1):]
+        if completion_ids.size(1) == 0:
+            completion_ids = torch.full(
+                (prompt_ids.size(0), 1),
+                fill_value=self.processing_class.eos_token_id,
+                dtype=prompt_ids.dtype,
+                device=prompt_ids.device,
+            )
+        completion_mask = first_eos_mask(completion_ids, self.processing_class.eos_token_id).to(prompt_mask.dtype)
+        return completion_ids, completion_mask
+
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
@@ -619,7 +862,7 @@ class NoiseGRPORecTrainer(GRPOTrainer):
         logits = logits / self.temperature
         return selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
 
-    def my_get_per_token_logps(self, model, input_ids, inputs_embeds, attention_mask, logits_to_keep):
+    def my_get_per_token_logps(self, model, input_ids, inputs_embeds, attention_mask, logits_to_keep, return_pred_ids=False):
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
         model_to_call = self._unwrap_latent_model(model)
 
@@ -643,7 +886,11 @@ class NoiseGRPORecTrainer(GRPOTrainer):
         # See https://github.com/huggingface/trl/issues/2770
         logits = logits[:, -logits_to_keep:]
         logits = logits / self.temperature
-        return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
+        per_token_logps = selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
+        if not return_pred_ids:
+            return per_token_logps
+        pred_ids = logits.argmax(dim=-1)
+        return per_token_logps, pred_ids
 
 
     @torch.no_grad()
@@ -652,6 +899,117 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             model, input_ids, input_embeds, attention_mask, logits_to_keep
         )
         return (-per_token_logps.detach().clone().sum(dim=-1)/logits_to_keep).exp()
+
+    def _build_advantages(self, rewards):
+        rewards_per_func = rewards.unsqueeze(1)
+        rewards_per_func = gather(rewards_per_func)
+        gathered_rewards = rewards_per_func.squeeze(1)
+        if gathered_rewards.numel() % self.num_generations != 0:
+            raise ValueError(
+                f"Reward count must be divisible by num_generations, got {gathered_rewards.numel()} "
+                f"and num_generations={self.num_generations}"
+            )
+        rewards_group = gathered_rewards.view(-1, self.num_generations)
+        if self.reward_backend == "flr":
+            baseline = rewards_group[:, :1].expand_as(rewards_group).reshape(-1).mean()
+            advantages_raw = gathered_rewards - baseline
+            advantages_norm = torch.norm(advantages_raw) + 1e-6
+            advantages = advantages_raw / advantages_norm
+        elif self.reward_backend == "on_policy":
+            baseline = rewards_group.mean(dim=1, keepdim=True)
+            advantages_raw = rewards_group - baseline
+            advantages_std = rewards_group.std(dim=1, keepdim=True, unbiased=False)
+            if self.discard_zero_advantage_groups:
+                active = advantages_std > 1e-6
+            else:
+                active = torch.ones_like(advantages_std, dtype=torch.bool)
+            advantages = advantages_raw / (advantages_std + 1e-6)
+            advantages = torch.where(active, advantages, torch.zeros_like(advantages)).reshape(-1)
+            advantages_norm = advantages_std.mean()
+        else:
+            baseline = rewards_group[:, :1]
+            advantages_raw = rewards_group - baseline
+            advantages_norm = torch.norm(advantages_raw[:, 1:], dim=1, keepdim=True) + 1e-6
+            advantages = (advantages_raw / advantages_norm).reshape(-1)
+        process_slice = slice(
+            self.accelerator.process_index * rewards.numel(),
+            (self.accelerator.process_index + 1) * rewards.numel(),
+        )
+        return advantages[process_slice], advantages_norm
+
+    def _generate_and_score_on_policy(self, prompt_ids, prompt_mask, target_completion_ids, target_completion_mask):
+        device = self.accelerator.device
+        completion_ids, completion_mask = self._generate_on_policy_completion_ids(prompt_ids, prompt_mask)
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+        batch_size = input_ids.size(0)
+
+        latent_model = self._unwrap_latent_model()
+        with torch.no_grad():
+            original_embeds = latent_model.generate_embs(input_ids, attention_mask)
+            noise = torch.zeros(
+                (batch_size, original_embeds.size(-1)),
+                dtype=original_embeds.dtype,
+                device=device,
+            )
+            old_per_token_logps = self.my_get_per_token_logps(
+                self.model,
+                input_ids,
+                original_embeds,
+                attention_mask,
+                logits_to_keep,
+            )
+            if self.beta == 0.0:
+                ref_per_token_logps = None
+            else:
+                ref_per_token_logps = self.my_get_per_token_logps(
+                    self.ref_model,
+                    input_ids,
+                    original_embeds,
+                    attention_mask,
+                    logits_to_keep,
+                )
+
+        sequence_scores = (
+            old_per_token_logps.detach() * completion_mask.to(old_per_token_logps.dtype)
+        ).sum(dim=-1) / completion_mask.sum(dim=-1).clamp_min(1).to(old_per_token_logps.dtype)
+        output_reward, on_policy_logs = self._compute_on_policy_reward(
+            completion_ids=completion_ids,
+            target_completion_ids=target_completion_ids,
+            target_mask=target_completion_mask,
+            sequence_scores=sequence_scores,
+        )
+        advantages, advantages_norm = self._build_advantages(output_reward)
+
+        mode = "eval" if self.control.should_evaluate else "train"
+        self._metrics[mode]["on_policy_reward"].append(
+            self.accelerator.gather_for_metrics(output_reward).mean().item()
+        )
+        self._metrics[mode]["on_policy_hit"].append(
+            self.accelerator.gather_for_metrics(on_policy_logs["hit"]).mean().item()
+        )
+        self._metrics[mode]["on_policy_rank"].append(
+            self.accelerator.gather_for_metrics(on_policy_logs["rank"]).mean().item()
+        )
+        self._metrics[mode]["on_policy_sequence_score"].append(
+            self.accelerator.gather_for_metrics(on_policy_logs["sequence_score"]).mean().item()
+        )
+        self._metrics[mode]["on_policy_advantages_norm"].append(
+            advantages_norm.detach().item() if torch.is_tensor(advantages_norm) else float(advantages_norm)
+        )
+
+        return {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "old_per_token_logps": old_per_token_logps,
+            "ref_per_token_logps": ref_per_token_logps,
+            "advantages": advantages,
+            "original_embeds": original_embeds,
+            "noise": noise,
+        }
 
     def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
@@ -672,6 +1030,14 @@ class NoiseGRPORecTrainer(GRPOTrainer):
         prompt_mask = prompt_completion_mask[:, :prompt_length]
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
+        if self.reward_backend == "on_policy":
+            return self._generate_and_score_on_policy(
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                target_completion_ids=completion_ids,
+                target_completion_mask=completion_mask,
+            )
+
         # generate the embeddings using LLM
         # then calculate the PPL and re-generate embeddings to get better PPL
         with torch.no_grad():
@@ -681,11 +1047,12 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             noise = torch.randn(
                 (batch_size, original_embeds.size(-1)), device=original_embeds.device
             ).mul(self.noise_std)
-            if self.use_listwise_reward:
+            if self.uses_grouped_reward:
                 if batch_size % self.num_generations != 0:
                     raise ValueError(
-                        f"Listwise reward expects batch_size divisible by num_generations, "
-                        f"got batch_size={batch_size}, num_generations={self.num_generations}"
+                        f"{self.reward_backend} reward expects batch_size divisible by "
+                        f"num_generations, got batch_size={batch_size}, "
+                        f"num_generations={self.num_generations}"
                     )
                 noise[
                     torch.arange(0, batch_size, self.num_generations, device=noise.device),
@@ -700,9 +1067,20 @@ class NoiseGRPORecTrainer(GRPOTrainer):
         
         with torch.no_grad():
             # if self.num_iterations > 1:
-            old_per_token_logps = self.my_get_per_token_logps(
-                self.model, prompt_completion_ids, original_embeds, prompt_completion_mask, logits_to_keep
-            )
+            if self.reward_backend == "flr":
+                old_per_token_logps, pred_ids = self.my_get_per_token_logps(
+                    self.model,
+                    prompt_completion_ids,
+                    original_embeds,
+                    prompt_completion_mask,
+                    logits_to_keep,
+                    return_pred_ids=True,
+                )
+            else:
+                old_per_token_logps = self.my_get_per_token_logps(
+                    self.model, prompt_completion_ids, original_embeds, prompt_completion_mask, logits_to_keep
+                )
+                pred_ids = None
             # else:
             #     old_per_token_logps = None
             if self.beta == 0.0:
@@ -715,7 +1093,8 @@ class NoiseGRPORecTrainer(GRPOTrainer):
         prompts = [None for _ in range(len(prompt_ids))]
         avg_logp = old_per_token_logps.clone().sum(dim=-1) / labels_length
         listwise_logs = None
-        if self.use_listwise_reward:
+        flr_logs = None
+        if self.reward_backend == "listwise":
             candidate_scores = self._score_candidate_set(
                 prompt_ids=prompt_ids,
                 prompt_mask=prompt_mask,
@@ -727,6 +1106,14 @@ class NoiseGRPORecTrainer(GRPOTrainer):
                 candidate_scores=candidate_scores,
                 avg_logp=avg_logp,
             )
+        elif self.reward_backend == "flr":
+            output_reward, flr_logs = self._compute_flr_reward(
+                old_per_token_logps=old_per_token_logps,
+                completion_ids=completion_ids,
+                pred_ids=pred_ids,
+                labels_length=labels_length,
+            )
+            avg_logp = flr_logs["avg_logp"]
         else:
             output_reward = -(-avg_logp).exp().to(torch.float32)
         rewards_per_func = output_reward.unsqueeze(1)
@@ -741,10 +1128,16 @@ class NoiseGRPORecTrainer(GRPOTrainer):
                 f"and num_generations={self.num_generations}"
             )
         rewards_group = rewards.view(-1, self.num_generations)
-        baseline = rewards_group[:, :1]
-        advantages_raw = rewards_group - baseline
-        advantages_norm = torch.norm(advantages_raw[:, 1:], dim=1, keepdim=True) + 1e-6
-        advantages = (advantages_raw / advantages_norm).reshape(-1)
+        if self.reward_backend == "flr":
+            baseline = rewards_group[:, :1].expand_as(rewards_group).reshape(-1).mean()
+            advantages_raw = rewards - baseline
+            advantages_norm = torch.norm(advantages_raw) + 1e-6
+            advantages = advantages_raw / advantages_norm
+        else:
+            baseline = rewards_group[:, :1]
+            advantages_raw = rewards_group - baseline
+            advantages_norm = torch.norm(advantages_raw[:, 1:], dim=1, keepdim=True) + 1e-6
+            advantages = (advantages_raw / advantages_norm).reshape(-1)
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
             (self.accelerator.process_index + 1) * len(prompts),
@@ -772,6 +1165,26 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             )
             self._metrics[mode]["listwise_reward"].append(
                 self.accelerator.gather_for_metrics(local_reward).mean().item()
+            )
+        elif self.reward_backend == "flr" and flr_logs is not None:
+            mode = "eval" if self.control.should_evaluate else "train"
+            self._metrics[mode]["flr_avg_logp"].append(
+                self.accelerator.gather_for_metrics(flr_logs["avg_logp"]).mean().item()
+            )
+            self._metrics[mode]["flr_seq_exact"].append(
+                self.accelerator.gather_for_metrics(flr_logs["seq_exact"]).mean().item()
+            )
+            self._metrics[mode]["flr_reward_logp"].append(
+                self.accelerator.gather_for_metrics(flr_logs["reward_logp"]).mean().item()
+            )
+            self._metrics[mode]["flr_reward_exact"].append(
+                self.accelerator.gather_for_metrics(flr_logs["reward_exact"]).mean().item()
+            )
+            self._metrics[mode]["flr_reward"].append(
+                self.accelerator.gather_for_metrics(output_reward).mean().item()
+            )
+            self._metrics[mode]["flr_advantages_norm"].append(
+                advantages_norm.detach().item()
             )
 
         return {

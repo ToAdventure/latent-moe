@@ -35,7 +35,12 @@ CATEGORY_DICT = {
     "yelp": "resturant",
 }
 
-GENERATION_BEST_METRICS = {"hr5_ndcg5", "generation_hr5_ndcg5"}
+GENERATION_BEST_METRICS = {
+    "hr5_ndcg5",
+    "generation_hr5_ndcg5",
+    "four_metric",
+    "generation_four_metric",
+}
 
 ROOT_MODEL_ARTIFACTS = (
     "model.safetensors",
@@ -72,6 +77,21 @@ def parse_bool(value, name: str) -> bool:
 def load_item_names(info_file):
     with open(info_file, "r") as f:
         return [line.split("\t")[0].strip("\"").strip(" ").strip("\n").strip("\"") for line in f]
+
+
+def parse_top_ks(value, default_top_k):
+    if value is None or value == "":
+        return [int(default_top_k)]
+    if isinstance(value, int):
+        return [int(value)]
+    if isinstance(value, (list, tuple)):
+        top_ks = [int(_) for _ in value]
+    else:
+        top_ks = [int(_) for _ in str(value).replace(";", ",").split(",") if str(_).strip()]
+    top_ks = sorted(set(top_ks))
+    if any(_ <= 0 for _ in top_ks):
+        raise ValueError(f"metric_top_ks must contain positive integers, got {value!r}")
+    return top_ks
 
 
 def cleanup_root_model_artifacts(output_dir: str):
@@ -138,6 +158,15 @@ def train(
     reward_w_soft: float = 0.5,
     reward_w_margin: float = 0.5,
     reward_w_logp: float = 0.05,
+    reward_backend: str = "auto",
+    flr_reward_w_logp: float = 0.1,
+    flr_reward_w_exact: float = 1.0,
+    listwise_negative_strategy: str = "random",
+    listwise_hard_negative_pool_size: int = 64,
+    on_policy_num_beams: int = 1,
+    on_policy_temperature: float = 1.0,
+    on_policy_reward_top_ks: str = "5,10",
+    discard_zero_advantage_groups: bool = True,
     noise_std: float = 1.0,
 
     use_vllm: bool = False,
@@ -152,11 +181,14 @@ def train(
     metric_eval_batch_size: int = 4,
     metric_num_beams: int = 10,
     metric_top_k: int = 5,
+    metric_top_ks: str = "",
     metric_max_new_tokens: int = 128,
     metric_temperature: float = 1.0,
     metric_guidance_scale: float = 1.0,
     metric_length_penalty: float = 1.0,
     metric_cutoff_len: int = 2560,
+    sanity_check_generation: bool = False,
+    generation_eval_steps: int = 0,
 
     resume_from_checkpoint: str = None,
     local_rank: int = 0,
@@ -169,10 +201,25 @@ def train(
     save_only_model = parse_bool(save_only_model, "save_only_model")
     save_final_model = parse_bool(save_final_model, "save_final_model")
     use_listwise_reward = parse_bool(use_listwise_reward, "use_listwise_reward")
+    discard_zero_advantage_groups = parse_bool(
+        discard_zero_advantage_groups, "discard_zero_advantage_groups"
+    )
+    sanity_check_generation = parse_bool(sanity_check_generation, "sanity_check_generation")
     use_fsdp2 = parse_bool(use_fsdp2, "use_fsdp2")
     fsdp2_activation_checkpointing = parse_bool(
         fsdp2_activation_checkpointing, "fsdp2_activation_checkpointing"
     )
+    reward_backend = str(reward_backend).strip().lower()
+    if reward_backend in ("", "auto", "none"):
+        reward_backend = "listwise" if use_listwise_reward else "ppl"
+    if reward_backend == "generation":
+        reward_backend = "on_policy"
+    if reward_backend not in ("listwise", "flr", "ppl", "on_policy"):
+        raise ValueError(
+            "reward_backend must be one of {'auto', 'listwise', 'flr', 'ppl', 'on_policy'}, "
+            f"got {reward_backend!r}"
+        )
+    uses_grouped_reward = reward_backend in ("listwise", "flr", "on_policy")
 
     configure_fsdp2_environment(use_fsdp2, fsdp2_state_dict_type)
     if use_fsdp2 and beta != 0.0:
@@ -212,15 +259,41 @@ def train(
     metric_for_best_model = None
     greater_is_better = None
     if generation_metric_enabled:
-        metric_for_best_model = f"eval_hr{metric_top_k}_ndcg{metric_top_k}"
+        if best_model_metric in ("four_metric", "generation_four_metric"):
+            metric_for_best_model = "eval_generation_best_metric"
+        else:
+            metric_for_best_model = f"eval_hr{metric_top_k}_ndcg{metric_top_k}"
         greater_is_better = True
     elif uses_best_metric:
         metric_for_best_model = "eval_loss"
         greater_is_better = False
 
-    if use_listwise_reward and micro_batch_size != num_generations:
+    print(f"Reward backend: {reward_backend}")
+    if reward_backend == "flr":
         print(
-            "Listwise GRPO requires one prompt group per device batch; "
+            "Using FLR reward: "
+            f"{flr_reward_w_logp} * avg_logp + {flr_reward_w_exact} * seq_exact"
+        )
+    elif reward_backend == "listwise":
+        print(
+            "Using listwise reward: "
+            f"topk={listwise_topk}, tau={listwise_tau}, "
+            f"weights=(dcg={reward_w_dcg}, soft={reward_w_soft}, "
+            f"margin={reward_w_margin}, logp={reward_w_logp}), "
+            f"negative_strategy={listwise_negative_strategy}, "
+            f"hard_pool={listwise_hard_negative_pool_size}"
+        )
+    elif reward_backend == "on_policy":
+        print(
+            "Using on-policy constrained generation reward: "
+            f"num_beams={on_policy_num_beams}, temperature={on_policy_temperature}, "
+            f"reward_top_ks={on_policy_reward_top_ks}, "
+            f"discard_zero_advantage_groups={discard_zero_advantage_groups}"
+        )
+
+    if uses_grouped_reward and micro_batch_size != num_generations:
+        print(
+            f"{reward_backend} GRPO requires one prompt group per device batch; "
             f"overriding micro_batch_size={micro_batch_size} to num_generations={num_generations}."
         )
         micro_batch_size = num_generations
@@ -295,17 +368,25 @@ def train(
     if generation_metric_enabled:
         metric_eval_sample = int(metric_eval_sample)
         metric_top_k = int(metric_top_k)
+        metric_top_ks_value = metric_top_ks
+        if metric_top_ks_value == "" and best_model_metric in ("four_metric", "generation_four_metric"):
+            metric_top_ks_value = "5,10"
+        metric_top_ks_list = parse_top_ks(metric_top_ks_value, metric_top_k)
+        metric_return_sequences = max(metric_top_ks_list)
         metric_eval_batch_size = int(metric_eval_batch_size)
-        if metric_top_k <= 0:
-            raise ValueError(f"metric_top_k must be positive, got {metric_top_k}")
         if metric_eval_batch_size <= 0:
             raise ValueError(f"metric_eval_batch_size must be positive, got {metric_eval_batch_size}")
-        metric_num_beams = max(int(metric_num_beams), metric_top_k)
+        metric_num_beams = max(int(metric_num_beams), metric_return_sequences)
+        if best_model_metric in ("four_metric", "generation_four_metric"):
+            metric_desc = " + ".join([f"HR@{k}*NDCG@{k}" for k in metric_top_ks_list])
+            metric_desc = f"mean({metric_desc})"
+        else:
+            metric_desc = f"HR@{metric_top_k} * NDCG@{metric_top_k}"
         print(
             "Using generation best metric: "
-            f"HR@{metric_top_k} * NDCG@{metric_top_k} from {info_file}; "
+            f"{metric_desc} from {info_file}; "
             f"sample={metric_eval_sample}, batch_size={metric_eval_batch_size}, "
-            f"num_beams={metric_num_beams}."
+            f"num_beams={metric_num_beams}, return_sequences={metric_return_sequences}."
         )
         generation_metric_dataset = D3Dataset(
             train_file=eval_file,
@@ -322,8 +403,9 @@ def train(
         generation_metric_config = {
             "batch_size": metric_eval_batch_size,
             "num_beams": metric_num_beams,
-            "return_sequences": metric_top_k,
+            "return_sequences": metric_return_sequences,
             "top_k": metric_top_k,
+            "top_ks": metric_top_ks_list,
             "max_new_tokens": int(metric_max_new_tokens),
             "temperature": float(metric_temperature),
             "guidance_scale": float(metric_guidance_scale),
@@ -345,7 +427,7 @@ def train(
                     new_data[k].append(ex[k])
         return HFDataset.from_dict(new_data)
 
-    if use_listwise_reward:
+    if uses_grouped_reward:
         hf_train_dataset = repeat_dataset_for_grpo(hf_train_dataset, num_generations)
 
     #############################
@@ -373,6 +455,15 @@ def train(
         reward_w_soft=reward_w_soft,
         reward_w_margin=reward_w_margin,
         reward_w_logp=reward_w_logp,
+        reward_backend=reward_backend,
+        flr_reward_w_logp=flr_reward_w_logp,
+        flr_reward_w_exact=flr_reward_w_exact,
+        listwise_negative_strategy=listwise_negative_strategy,
+        listwise_hard_negative_pool_size=listwise_hard_negative_pool_size,
+        on_policy_num_beams=on_policy_num_beams,
+        on_policy_temperature=on_policy_temperature,
+        on_policy_reward_top_ks=on_policy_reward_top_ks,
+        discard_zero_advantage_groups=discard_zero_advantage_groups,
         noise_std=noise_std,
         generation_metric_config=generation_metric_config,
         generation_metric_dataset=generation_metric_dataset,
@@ -402,7 +493,8 @@ def train(
             seed=seed,
             gradient_accumulation_steps=gradient_accumulation_steps,
             lr_scheduler_type="cosine",
-            eval_strategy="epoch",
+            eval_strategy="steps" if int(generation_eval_steps) > 0 else "epoch",
+            eval_steps=int(generation_eval_steps) if int(generation_eval_steps) > 0 else None,
             save_strategy=save_strategy,
             save_total_limit=save_total_limit,
             save_only_model=save_only_model,
@@ -421,6 +513,14 @@ def train(
         processing_class=tokenizer,
     )
     model.config.use_cache = False
+    if sanity_check_generation:
+        if generation_metric_config is None:
+            if trainer.is_world_process_zero():
+                print("Skipping sanity generation check because generation metric is disabled.")
+        else:
+            sanity_metrics = trainer.evaluate_generation_metric()
+            if trainer.is_world_process_zero():
+                print(f"Sanity generation metrics before training: {sanity_metrics}")
     ###############
     # Training loop
     ###############

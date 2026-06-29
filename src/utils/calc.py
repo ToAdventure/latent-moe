@@ -9,6 +9,17 @@ import pandas as pd
 import numpy as np
     
 from tqdm import tqdm
+
+
+def normalize_title(value):
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    text = str(value).strip(" \n")
+    if text.startswith(":"):
+        text = text[1:].strip(" \n")
+    return text.strip("\"").strip(" ")
+
+
 def gao(path, item_path):
     print(path)
     print(item_path)
@@ -44,14 +55,14 @@ def gao(path, item_path):
         test_data = json.load(f)
         f.close()
         
-        text = [ [_.strip(" \n").strip("\"").strip(" ") for _ in sample["predict"]] for sample in test_data]
+        text = [[normalize_title(_) for _ in sample["predict"]] for sample in test_data]
         
         for index, sample in tqdm(enumerate(text)):
 
                 if type(test_data[index]['output']) == list:
-                    target_item = test_data[index]['output'][0].strip("\"").strip(" ")
+                    target_item = normalize_title(test_data[index]['output'][0])
                 else:
-                    target_item = test_data[index]['output'].strip(" \n\"")
+                    target_item = normalize_title(test_data[index]['output'])
                 minID = 1000000
                 # rank = dist.argsort(dim = -1)
                 for i in range(len(sample)):

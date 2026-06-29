@@ -39,11 +39,14 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 : "${METRIC_EVAL_BATCH_SIZE:=4}"
 : "${METRIC_NUM_BEAMS:=10}"
 : "${METRIC_TOP_K:=5}"
+: "${METRIC_TOP_KS:=}"
 : "${METRIC_MAX_NEW_TOKENS:=128}"
 : "${METRIC_TEMPERATURE:=1.0}"
 : "${METRIC_GUIDANCE_SCALE:=1.0}"
 : "${METRIC_LENGTH_PENALTY:=1.0}"
 : "${METRIC_CUTOFF_LEN:=2560}"
+: "${SANITY_CHECK_GENERATION:=false}"
+: "${GENERATION_EVAL_STEPS:=0}"
 : "${USE_LISTWISE_REWARD:=True}"
 : "${NUM_LISTWISE_NEGATIVES:=15}"
 : "${LISTWISE_CANDIDATE_CHUNK_SIZE:=8}"
@@ -53,6 +56,15 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 : "${REWARD_W_SOFT:=0.5}"
 : "${REWARD_W_MARGIN:=0.5}"
 : "${REWARD_W_LOGP:=0.05}"
+: "${REWARD_BACKEND:=auto}"
+: "${FLR_REWARD_W_LOGP:=0.1}"
+: "${FLR_REWARD_W_EXACT:=1.0}"
+: "${LISTWISE_NEGATIVE_STRATEGY:=random}"
+: "${LISTWISE_HARD_NEGATIVE_POOL_SIZE:=64}"
+: "${ON_POLICY_NUM_BEAMS:=1}"
+: "${ON_POLICY_TEMPERATURE:=1.0}"
+: "${ON_POLICY_REWARD_TOP_KS:=5,10}"
+: "${DISCARD_ZERO_ADVANTAGE_GROUPS:=true}"
 : "${NOISE_STD:=1.0}"
 : "${LATENT_LAYER_TYPE:=deepseek_moe}"
 : "${MOE_NUM_EXPERTS:=4}"
@@ -100,6 +112,15 @@ echo "Using MOE_FINE_GRAINED_FACTOR=${MOE_FINE_GRAINED_FACTOR}"
 echo "Using MOE_NUM_SHARED_EXPERTS=${MOE_NUM_SHARED_EXPERTS}"
 echo "Using MOE_LOAD_BALANCE_WEIGHT=${MOE_LOAD_BALANCE_WEIGHT}"
 echo "Using USE_LISTWISE_REWARD=${USE_LISTWISE_REWARD}"
+echo "Using REWARD_BACKEND=${REWARD_BACKEND}"
+echo "Using FLR_REWARD_W_LOGP=${FLR_REWARD_W_LOGP}"
+echo "Using FLR_REWARD_W_EXACT=${FLR_REWARD_W_EXACT}"
+echo "Using LISTWISE_NEGATIVE_STRATEGY=${LISTWISE_NEGATIVE_STRATEGY}"
+echo "Using LISTWISE_HARD_NEGATIVE_POOL_SIZE=${LISTWISE_HARD_NEGATIVE_POOL_SIZE}"
+echo "Using ON_POLICY_NUM_BEAMS=${ON_POLICY_NUM_BEAMS}"
+echo "Using ON_POLICY_TEMPERATURE=${ON_POLICY_TEMPERATURE}"
+echo "Using ON_POLICY_REWARD_TOP_KS=${ON_POLICY_REWARD_TOP_KS}"
+echo "Using DISCARD_ZERO_ADVANTAGE_GROUPS=${DISCARD_ZERO_ADVANTAGE_GROUPS}"
 echo "Using NUM_LISTWISE_NEGATIVES=${NUM_LISTWISE_NEGATIVES}"
 echo "Using LISTWISE_CANDIDATE_CHUNK_SIZE=${LISTWISE_CANDIDATE_CHUNK_SIZE}"
 echo "Using LISTWISE_TOPK=${LISTWISE_TOPK}"
@@ -112,6 +133,9 @@ echo "Using METRIC_EVAL_SAMPLE=${METRIC_EVAL_SAMPLE}"
 echo "Using METRIC_EVAL_BATCH_SIZE=${METRIC_EVAL_BATCH_SIZE}"
 echo "Using METRIC_NUM_BEAMS=${METRIC_NUM_BEAMS}"
 echo "Using METRIC_TOP_K=${METRIC_TOP_K}"
+echo "Using METRIC_TOP_KS=${METRIC_TOP_KS}"
+echo "Using SANITY_CHECK_GENERATION=${SANITY_CHECK_GENERATION}"
+echo "Using GENERATION_EVAL_STEPS=${GENERATION_EVAL_STEPS}"
 echo "Using USE_FSDP2=${USE_FSDP2}"
 echo "Using RUN_GRPO_EVAL=${RUN_GRPO_EVAL}"
 
@@ -300,11 +324,14 @@ for category in "${CATEGORIES[@]}"; do
             --metric_eval_batch_size "${METRIC_EVAL_BATCH_SIZE}" \
             --metric_num_beams "${METRIC_NUM_BEAMS}" \
             --metric_top_k "${METRIC_TOP_K}" \
+            --metric_top_ks "${METRIC_TOP_KS}" \
             --metric_max_new_tokens "${METRIC_MAX_NEW_TOKENS}" \
             --metric_temperature "${METRIC_TEMPERATURE}" \
             --metric_guidance_scale "${METRIC_GUIDANCE_SCALE}" \
             --metric_length_penalty "${METRIC_LENGTH_PENALTY}" \
             --metric_cutoff_len "${METRIC_CUTOFF_LEN}" \
+            --sanity_check_generation "${SANITY_CHECK_GENERATION}" \
+            --generation_eval_steps "${GENERATION_EVAL_STEPS}" \
             --latent_layer_type "${LATENT_LAYER_TYPE}" \
             --moe_num_experts "${MOE_NUM_EXPERTS}" \
             --moe_top_k "${MOE_TOP_K}" \
@@ -326,6 +353,15 @@ for category in "${CATEGORIES[@]}"; do
             --reward_w_soft "${REWARD_W_SOFT}" \
             --reward_w_margin "${REWARD_W_MARGIN}" \
             --reward_w_logp "${REWARD_W_LOGP}" \
+            --reward_backend "${REWARD_BACKEND}" \
+            --flr_reward_w_logp "${FLR_REWARD_W_LOGP}" \
+            --flr_reward_w_exact "${FLR_REWARD_W_EXACT}" \
+            --listwise_negative_strategy "${LISTWISE_NEGATIVE_STRATEGY}" \
+            --listwise_hard_negative_pool_size "${LISTWISE_HARD_NEGATIVE_POOL_SIZE}" \
+            --on_policy_num_beams "${ON_POLICY_NUM_BEAMS}" \
+            --on_policy_temperature "${ON_POLICY_TEMPERATURE}" \
+            --on_policy_reward_top_ks "${ON_POLICY_REWARD_TOP_KS}" \
+            --discard_zero_advantage_groups "${DISCARD_ZERO_ADVANTAGE_GROUPS}" \
             --noise_std "${NOISE_STD}" \
             --use_fsdp2 "${USE_FSDP2}" \
             --fsdp2_activation_checkpointing "${FSDP2_ACTIVATION_CHECKPOINTING}" \

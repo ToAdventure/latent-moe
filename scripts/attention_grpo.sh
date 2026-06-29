@@ -23,6 +23,9 @@ set -euo pipefail
 : "${REWARD_W_SOFT:=0.5}"
 : "${REWARD_W_MARGIN:=0.5}"
 : "${REWARD_W_LOGP:=0.05}"
+: "${REWARD_BACKEND:=auto}"
+: "${FLR_REWARD_W_LOGP:=0.1}"
+: "${FLR_REWARD_W_EXACT:=1.0}"
 : "${NOISE_STD:=1.0}"
 : "${LOAD_BEST_MODEL_AT_END:=true}"
 : "${SAVE_STRATEGY:=best}"
@@ -54,6 +57,9 @@ echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} with NUM_GPUS=${NUM_GPU
 echo "Using LATENT_LAYER_TYPE=${LATENT_LAYER_TYPE}"
 echo "Using MOE_LOAD_BALANCE_WEIGHT=${MOE_LOAD_BALANCE_WEIGHT}"
 echo "Using USE_LISTWISE_REWARD=${USE_LISTWISE_REWARD}"
+echo "Using REWARD_BACKEND=${REWARD_BACKEND}"
+echo "Using FLR_REWARD_W_LOGP=${FLR_REWARD_W_LOGP}"
+echo "Using FLR_REWARD_W_EXACT=${FLR_REWARD_W_EXACT}"
 echo "Using LISTWISE_CANDIDATE_CHUNK_SIZE=${LISTWISE_CANDIDATE_CHUNK_SIZE}"
 echo "Using SAVE_STRATEGY=${SAVE_STRATEGY}"
 echo "Using BEST_MODEL_METRIC=${BEST_MODEL_METRIC}"
@@ -174,6 +180,9 @@ for category in "Toys_and_Games"; do
             --reward_w_soft ${REWARD_W_SOFT} \
             --reward_w_margin ${REWARD_W_MARGIN} \
             --reward_w_logp ${REWARD_W_LOGP} \
+            --reward_backend ${REWARD_BACKEND} \
+            --flr_reward_w_logp ${FLR_REWARD_W_LOGP} \
+            --flr_reward_w_exact ${FLR_REWARD_W_EXACT} \
             --noise_std ${NOISE_STD} \
             --use_fsdp2 ${USE_FSDP2} \
             --fsdp2_activation_checkpointing ${FSDP2_ACTIVATION_CHECKPOINTING} \
