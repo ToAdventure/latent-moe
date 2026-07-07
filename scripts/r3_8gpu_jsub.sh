@@ -25,6 +25,7 @@ export BASE_MODEL="${BASE_MODEL:-/data/gtq/latent-moe/models/Qwen2.5-1.5B}"
 # Default to the original latent attention layer. Override these at submit time
 # for MoE, for example: LATENT_LAYER_TYPE=deepseek_moe MOE_NUM_EXPERTS=8.
 export LATENT_LAYER_TYPE="${LATENT_LAYER_TYPE:-attention}"
+export MOE_EXPERT_TYPE="${MOE_EXPERT_TYPE:-mlp}"
 export MOE_NUM_EXPERTS="${MOE_NUM_EXPERTS:-4}"
 export MOE_TOP_K="${MOE_TOP_K:-2}"
 export MOE_EXPERT_HIDDEN_SIZE="${MOE_EXPERT_HIDDEN_SIZE:-0}"
@@ -35,6 +36,8 @@ export MOE_ROUTER_JITTER_NOISE="${MOE_ROUTER_JITTER_NOISE:-0.0}"
 export MOE_FINE_GRAINED_FACTOR="${MOE_FINE_GRAINED_FACTOR:-2}"
 export MOE_NUM_SHARED_EXPERTS="${MOE_NUM_SHARED_EXPERTS:-1}"
 export MOE_SHARED_EXPERT_WEIGHT="${MOE_SHARED_EXPERT_WEIGHT:-1.0}"
+export MOE_LOAD_BALANCE_WEIGHT="${MOE_LOAD_BALANCE_WEIGHT:-0.01}"
+export MOE_BALANCE_LOSS_MODE="${MOE_BALANCE_LOSS_MODE:-fixed}"
 
 mkdir -p ./logs
 TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
@@ -56,6 +59,8 @@ log "Mode                 : $MODE"
 log "CUDA_VISIBLE_DEVICES : $CUDA_VISIBLE_DEVICES"
 log "Base model           : $BASE_MODEL"
 log "Latent layer type    : $LATENT_LAYER_TYPE"
+log "MOE_EXPERT_TYPE      : $MOE_EXPERT_TYPE"
+log "MOE_BALANCE_MODE     : $MOE_BALANCE_LOSS_MODE"
 log "Log file             : $LOG_FILE"
 log "Start time           : $(date '+%Y-%m-%d %H:%M:%S')"
 
@@ -67,7 +72,22 @@ case "$MODE" in
     grpo)
         section "GRPO Attention Tuning"
         export LATENT_LAYER_TYPE="${LATENT_LAYER_TYPE_FOR_GRPO:-auto}"
+        export MOE_EXPERT_TYPE="${MOE_EXPERT_TYPE_FOR_GRPO:-auto}"
+        export MOE_NUM_EXPERTS="${MOE_NUM_EXPERTS_FOR_GRPO:-auto}"
+        export MOE_TOP_K="${MOE_TOP_K_FOR_GRPO:-auto}"
+        export MOE_EXPERT_HIDDEN_SIZE="${MOE_EXPERT_HIDDEN_SIZE_FOR_GRPO:-auto}"
+        export MOE_EXPERT_HIDDEN_MULTIPLIER="${MOE_EXPERT_HIDDEN_MULTIPLIER_FOR_GRPO:-auto}"
+        export MOE_DROPOUT="${MOE_DROPOUT_FOR_GRPO:-auto}"
+        export MOE_ROUTER_TEMPERATURE="${MOE_ROUTER_TEMPERATURE_FOR_GRPO:-auto}"
+        export MOE_ROUTER_JITTER_NOISE="${MOE_ROUTER_JITTER_NOISE_FOR_GRPO:-auto}"
+        export MOE_LOAD_BALANCE_WEIGHT="${MOE_LOAD_BALANCE_WEIGHT_FOR_GRPO:-auto}"
+        export MOE_BALANCE_LOSS_MODE="${MOE_BALANCE_LOSS_MODE_FOR_GRPO:-auto}"
+        export MOE_FINE_GRAINED_FACTOR="${MOE_FINE_GRAINED_FACTOR_FOR_GRPO:-auto}"
+        export MOE_NUM_SHARED_EXPERTS="${MOE_NUM_SHARED_EXPERTS_FOR_GRPO:-auto}"
+        export MOE_SHARED_EXPERT_WEIGHT="${MOE_SHARED_EXPERT_WEIGHT_FOR_GRPO:-auto}"
         log "GRPO latent layer type: $LATENT_LAYER_TYPE"
+        log "GRPO MoE expert type  : $MOE_EXPERT_TYPE"
+        log "GRPO MoE balance mode : $MOE_BALANCE_LOSS_MODE"
         bash ./scripts/attention_grpo.sh "$@"
         ;;
     eval)

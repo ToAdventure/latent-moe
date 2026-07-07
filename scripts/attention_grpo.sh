@@ -3,17 +3,19 @@ set -euo pipefail
 
 : "${GPU_IDS:=${CUDA_VISIBLE_DEVICES:-0,1,2,3}}"
 : "${LATENT_LAYER_TYPE:=auto}"
-: "${MOE_NUM_EXPERTS:=4}"
-: "${MOE_TOP_K:=2}"
-: "${MOE_EXPERT_HIDDEN_SIZE:=0}"
-: "${MOE_EXPERT_HIDDEN_MULTIPLIER:=1.0}"
-: "${MOE_DROPOUT:=0.0}"
-: "${MOE_ROUTER_TEMPERATURE:=1.0}"
-: "${MOE_ROUTER_JITTER_NOISE:=0.0}"
-: "${MOE_LOAD_BALANCE_WEIGHT:=0.00}"
-: "${MOE_FINE_GRAINED_FACTOR:=1}"
-: "${MOE_NUM_SHARED_EXPERTS:=1}"
-: "${MOE_SHARED_EXPERT_WEIGHT:=1.0}"
+: "${MOE_EXPERT_TYPE:=auto}"
+: "${MOE_NUM_EXPERTS:=auto}"
+: "${MOE_TOP_K:=auto}"
+: "${MOE_EXPERT_HIDDEN_SIZE:=auto}"
+: "${MOE_EXPERT_HIDDEN_MULTIPLIER:=auto}"
+: "${MOE_DROPOUT:=auto}"
+: "${MOE_ROUTER_TEMPERATURE:=auto}"
+: "${MOE_ROUTER_JITTER_NOISE:=auto}"
+: "${MOE_LOAD_BALANCE_WEIGHT:=auto}"
+: "${MOE_BALANCE_LOSS_MODE:=auto}"
+: "${MOE_FINE_GRAINED_FACTOR:=auto}"
+: "${MOE_NUM_SHARED_EXPERTS:=auto}"
+: "${MOE_SHARED_EXPERT_WEIGHT:=auto}"
 : "${USE_LISTWISE_REWARD:=True}"
 : "${NUM_LISTWISE_NEGATIVES:=15}"
 : "${LISTWISE_CANDIDATE_CHUNK_SIZE:=8}"
@@ -55,7 +57,9 @@ fi
 
 echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} with NUM_GPUS=${NUM_GPUS}"
 echo "Using LATENT_LAYER_TYPE=${LATENT_LAYER_TYPE}"
+echo "Using MOE_EXPERT_TYPE=${MOE_EXPERT_TYPE}"
 echo "Using MOE_LOAD_BALANCE_WEIGHT=${MOE_LOAD_BALANCE_WEIGHT}"
+echo "Using MOE_BALANCE_LOSS_MODE=${MOE_BALANCE_LOSS_MODE}"
 echo "Using USE_LISTWISE_REWARD=${USE_LISTWISE_REWARD}"
 echo "Using REWARD_BACKEND=${REWARD_BACKEND}"
 echo "Using FLR_REWARD_W_LOGP=${FLR_REWARD_W_LOGP}"
@@ -143,6 +147,7 @@ for category in "Toys_and_Games"; do
             --num_generations 8 --sample -1 --num_epochs 3 --info_file $info_file \
             --base_model $base_model --output_dir $out --beta 0.00 \
             --latent_layer_type ${LATENT_LAYER_TYPE} \
+            --moe_expert_type ${MOE_EXPERT_TYPE} \
             --moe_num_experts ${MOE_NUM_EXPERTS} --moe_top_k ${MOE_TOP_K} \
             --moe_expert_hidden_size ${MOE_EXPERT_HIDDEN_SIZE} \
             --moe_expert_hidden_multiplier ${MOE_EXPERT_HIDDEN_MULTIPLIER} \
@@ -150,6 +155,7 @@ for category in "Toys_and_Games"; do
             --moe_router_temperature ${MOE_ROUTER_TEMPERATURE} \
             --moe_router_jitter_noise ${MOE_ROUTER_JITTER_NOISE} \
             --moe_load_balance_weight ${MOE_LOAD_BALANCE_WEIGHT} \
+            --moe_balance_loss_mode ${MOE_BALANCE_LOSS_MODE} \
             --moe_fine_grained_factor ${MOE_FINE_GRAINED_FACTOR} \
             --moe_num_shared_experts ${MOE_NUM_SHARED_EXPERTS} \
             --moe_shared_expert_weight ${MOE_SHARED_EXPERT_WEIGHT} \

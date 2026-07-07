@@ -394,6 +394,8 @@ def train(
     moe_num_shared_experts: int = 1,
     moe_shared_expert_weight: float = 1.0,
     moe_load_balance_weight: float = 0.01,
+    moe_expert_type: str = "mlp",
+    moe_balance_loss_mode: str = "fixed",
     
     # training hyperparams
     batch_size: int = 128,
@@ -515,6 +517,7 @@ def train(
         model_config,
         latent_layer_type=latent_layer_type,
         end_k=end_k,
+        moe_expert_type=moe_expert_type,
         moe_num_experts=moe_num_experts,
         moe_top_k=moe_top_k,
         moe_expert_hidden_size=moe_expert_hidden_size,
@@ -526,6 +529,12 @@ def train(
         moe_num_shared_experts=moe_num_shared_experts,
         moe_shared_expert_weight=moe_shared_expert_weight,
         moe_load_balance_weight=moe_load_balance_weight,
+        moe_balance_loss_mode=moe_balance_loss_mode,
+    )
+    print(
+        f"Latent layer type: {model_config.latent_layer_type}; "
+        f"MoE expert type: {getattr(model_config, 'moe_expert_type', 'mlp')}; "
+        f"MoE balance loss mode: {getattr(model_config, 'moe_balance_loss_mode', 'fixed')}"
     )
     model = LatentModel.from_pretrained(
         base_model,

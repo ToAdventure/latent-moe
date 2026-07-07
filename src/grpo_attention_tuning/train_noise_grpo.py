@@ -123,17 +123,19 @@ def train(
     lr: float = float(6.0e-6),
     end_k: int = -1,
     latent_layer_type: str = "auto",
-    moe_num_experts: int = 4,
-    moe_top_k: int = 2,
-    moe_expert_hidden_size: int = 0,
-    moe_expert_hidden_multiplier: float = 1.0,
-    moe_dropout: float = 0.0,
-    moe_router_temperature: float = 1.0,
-    moe_router_jitter_noise: float = 0.0,
-    moe_fine_grained_factor: int = 2,
-    moe_num_shared_experts: int = 1,
-    moe_shared_expert_weight: float = 1.0,
-    moe_load_balance_weight: float = 0.01,
+    moe_num_experts="auto",
+    moe_top_k="auto",
+    moe_expert_hidden_size="auto",
+    moe_expert_hidden_multiplier="auto",
+    moe_dropout="auto",
+    moe_router_temperature="auto",
+    moe_router_jitter_noise="auto",
+    moe_fine_grained_factor="auto",
+    moe_num_shared_experts="auto",
+    moe_shared_expert_weight="auto",
+    moe_load_balance_weight="auto",
+    moe_expert_type: str = "auto",
+    moe_balance_loss_mode: str = "auto",
     num_epochs: int = 1,
     batch_size: int = 256,
     micro_batch_size: int = 8,
@@ -171,6 +173,8 @@ def train(
 
     use_vllm: bool = False,
     vllm_gpu_memory_utilization: float = 0.7,
+    bf16: bool = True,
+    fp16: bool = False,
     load_best_model_at_end: bool = True,
     save_strategy: str = "best",
     save_total_limit: int = 1,
@@ -205,6 +209,8 @@ def train(
         discard_zero_advantage_groups, "discard_zero_advantage_groups"
     )
     sanity_check_generation = parse_bool(sanity_check_generation, "sanity_check_generation")
+    bf16 = parse_bool(bf16, "bf16")
+    fp16 = parse_bool(fp16, "fp16")
     use_fsdp2 = parse_bool(use_fsdp2, "use_fsdp2")
     fsdp2_activation_checkpointing = parse_bool(
         fsdp2_activation_checkpointing, "fsdp2_activation_checkpointing"
@@ -214,12 +220,15 @@ def train(
         reward_backend = "listwise" if use_listwise_reward else "ppl"
     if reward_backend == "generation":
         reward_backend = "on_policy"
-    if reward_backend not in ("listwise", "flr", "ppl", "on_policy"):
+    if reward_backend in ("generated_listwise", "on_policy_generated_listwise"):
+        reward_backend = "on_policy_listwise"
+    if reward_backend not in ("listwise", "flr", "ppl", "on_policy", "on_policy_listwise"):
         raise ValueError(
-            "reward_backend must be one of {'auto', 'listwise', 'flr', 'ppl', 'on_policy'}, "
+            "reward_backend must be one of "
+            "{'auto', 'listwise', 'flr', 'ppl', 'on_policy', 'on_policy_listwise'}, "
             f"got {reward_backend!r}"
         )
-    uses_grouped_reward = reward_backend in ("listwise", "flr", "on_policy")
+    uses_grouped_reward = reward_backend in ("listwise", "flr", "on_policy", "on_policy_listwise")
 
     configure_fsdp2_environment(use_fsdp2, fsdp2_state_dict_type)
     if use_fsdp2 and beta != 0.0:
@@ -290,6 +299,15 @@ def train(
             f"reward_top_ks={on_policy_reward_top_ks}, "
             f"discard_zero_advantage_groups={discard_zero_advantage_groups}"
         )
+    elif reward_backend == "on_policy_listwise":
+        print(
+            "Using on-policy generated listwise reward: "
+            f"num_beams={on_policy_num_beams}, temperature={on_policy_temperature}, "
+            f"topk={listwise_topk}, tau={listwise_tau}, "
+            f"weights=(dcg={reward_w_dcg}, soft={reward_w_soft}, "
+            f"margin={reward_w_margin}, logp={reward_w_logp}), "
+            f"discard_zero_advantage_groups={discard_zero_advantage_groups}"
+        )
 
     if uses_grouped_reward and micro_batch_size != num_generations:
         print(
@@ -309,6 +327,7 @@ def train(
         model_config,
         latent_layer_type=latent_layer_type,
         end_k=end_k,
+        moe_expert_type=moe_expert_type,
         moe_num_experts=moe_num_experts,
         moe_top_k=moe_top_k,
         moe_expert_hidden_size=moe_expert_hidden_size,
@@ -320,16 +339,22 @@ def train(
         moe_num_shared_experts=moe_num_shared_experts,
         moe_shared_expert_weight=moe_shared_expert_weight,
         moe_load_balance_weight=moe_load_balance_weight,
+        moe_balance_loss_mode=moe_balance_loss_mode,
+    )
+    print(
+        f"Latent layer type: {model_config.latent_layer_type}; "
+        f"MoE expert type: {getattr(model_config, 'moe_expert_type', 'mlp')}; "
+        f"MoE balance loss mode: {getattr(model_config, 'moe_balance_loss_mode', 'fixed')}"
     )
     model = LatentModel.from_pretrained(base_model,
         config=model_config,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32),
     )
     model.attention.end_k = end_k
-    for param in model.model.parameters():
-        param.requires_grad = False
-    for param in model.lm_head.parameters():
-        param.requires_grad = False
+    # for param in model.model.parameters():
+    #     param.requires_grad = False
+    # for param in model.lm_head.parameters():
+    #     param.requires_grad = False
     def count_trainable_params(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
     trainable_params = count_trainable_params(model)
@@ -505,7 +530,8 @@ def train(
             fsdp="auto_wrap" if use_fsdp2 else "",
             fsdp_config=build_fsdp2_config(fsdp2_activation_checkpointing) if use_fsdp2 else None,
             report_to="none",
-            bf16=True,
+            bf16=bf16,
+            fp16=fp16,
             logging_steps=1,
         ),
         train_dataset=hf_train_dataset,

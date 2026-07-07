@@ -184,15 +184,23 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             reward_backend = "listwise" if use_listwise_reward else "ppl"
         if reward_backend == "generation":
             reward_backend = "on_policy"
-        if reward_backend not in ("listwise", "flr", "ppl", "on_policy"):
+        if reward_backend in ("generated_listwise", "on_policy_generated_listwise"):
+            reward_backend = "on_policy_listwise"
+        if reward_backend not in ("listwise", "flr", "ppl", "on_policy", "on_policy_listwise"):
             raise ValueError(
-                "reward_backend must be one of {'auto', 'listwise', 'flr', 'ppl', 'on_policy'}, "
+                "reward_backend must be one of "
+                "{'auto', 'listwise', 'flr', 'ppl', 'on_policy', 'on_policy_listwise'}, "
                 f"got {reward_backend!r}"
             )
         self.reward_backend = reward_backend
         self.use_listwise_reward = self.reward_backend == "listwise"
-        self.use_on_policy_reward = self.reward_backend == "on_policy"
-        self.uses_grouped_reward = self.reward_backend in ("listwise", "flr", "on_policy")
+        self.use_on_policy_reward = self.reward_backend in ("on_policy", "on_policy_listwise")
+        self.uses_grouped_reward = self.reward_backend in (
+            "listwise",
+            "flr",
+            "on_policy",
+            "on_policy_listwise",
+        )
         self.num_listwise_negatives = num_listwise_negatives
         self.listwise_candidate_chunk_size = int(listwise_candidate_chunk_size)
         if self.listwise_candidate_chunk_size <= 0:
@@ -497,6 +505,35 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             return model.module
         return model
 
+    def _get_moe_balance_loss(self, latent_model):
+        attention = getattr(latent_model, "attention", None)
+        if attention is None:
+            return None, None
+        balance_loss = getattr(attention, "load_balance_loss", None)
+        if balance_loss is None or not torch.is_tensor(balance_loss):
+            return None, attention
+        return balance_loss, attention
+
+    def _log_moe_balance_metrics(self, attention, mode):
+        if attention is None:
+            return
+
+        metric_values = {
+            "moe_balance_loss": getattr(attention, "load_balance_loss", None),
+            "moe_balance_raw_loss": getattr(attention, "load_balance_raw_loss", None),
+            "moe_balance_effective_weight": getattr(attention, "load_balance_effective_weight", None),
+            "moe_balance_log_var": getattr(attention, "load_balance_log_var", None),
+        }
+        for name, value in metric_values.items():
+            if value is None or not torch.is_tensor(value):
+                continue
+            detached = value.detach()
+            if detached.numel() != 1:
+                detached = detached.mean()
+            self._metrics[mode][name].append(
+                self.accelerator.gather_for_metrics(detached.reshape(1)).mean().item()
+            )
+
     def _load_catalog_candidate_ids(self, info_file):
         candidate_ids = []
         with open(info_file, "r", encoding="utf-8") as f:
@@ -794,6 +831,150 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             "reward": rewards.detach(),
         }
 
+    def _compute_on_policy_listwise_reward(self, candidate_scores, avg_logp, candidate_titles, target_titles):
+        batch_size = candidate_scores.size(0)
+        if batch_size % self.num_generations != 0:
+            raise ValueError(
+                f"on_policy_listwise reward expects batch_size divisible by num_generations, "
+                f"got batch_size={batch_size}, num_generations={self.num_generations}"
+            )
+
+        rewards = torch.zeros(batch_size, device=candidate_scores.device, dtype=torch.float32)
+        ranks = torch.full(
+            (batch_size,),
+            float(self.num_generations + 1),
+            device=candidate_scores.device,
+            dtype=torch.float32,
+        )
+        dcg_values = torch.zeros_like(rewards)
+        soft_values = torch.zeros_like(rewards)
+        margin_values = torch.zeros_like(rewards)
+        positive_mask = torch.zeros_like(rewards)
+        negative_counts = torch.zeros_like(rewards)
+
+        for group_start in range(0, batch_size, self.num_generations):
+            group_end = group_start + self.num_generations
+            group_scores = candidate_scores[group_start:group_end]
+            target = target_titles[group_start]
+
+            positive_indices = [
+                idx
+                for idx, title in enumerate(candidate_titles[group_start:group_end])
+                if title == target
+            ]
+            if 0 not in positive_indices:
+                positive_indices.insert(0, 0)
+            positive_set = set(positive_indices)
+            negative_indices = [idx for idx in range(self.num_generations) if idx not in positive_set]
+
+            pos_score = group_scores[0]
+            if negative_indices:
+                neg_idx_tensor = torch.tensor(negative_indices, device=candidate_scores.device, dtype=torch.long)
+                neg_scores = group_scores.index_select(0, neg_idx_tensor)
+                hardest_neg = neg_scores.max()
+                rank = 1 + (neg_scores > pos_score).sum()
+                soft_scores = torch.cat([pos_score.view(1), neg_scores], dim=0)
+                soft_reward = torch.softmax(soft_scores / self.listwise_tau, dim=0)[0]
+            else:
+                neg_scores = None
+                hardest_neg = pos_score
+                rank = torch.ones((), device=candidate_scores.device, dtype=torch.long)
+                soft_reward = torch.ones((), device=candidate_scores.device, dtype=group_scores.dtype)
+
+            rank_float = rank.to(torch.float32)
+            dcg_reward = 1.0 / torch.log2(rank_float + 1.0)
+            if self.listwise_topk > 0:
+                dcg_reward = torch.where(
+                    rank <= self.listwise_topk,
+                    dcg_reward,
+                    torch.zeros_like(dcg_reward),
+                )
+            margin_reward = torch.sigmoid((pos_score - hardest_neg) / self.listwise_tau)
+            target_reward = (
+                self.reward_w_dcg * dcg_reward
+                + self.reward_w_soft * soft_reward
+                + self.reward_w_margin * margin_reward
+                + self.reward_w_logp * avg_logp[group_start].to(group_scores.dtype)
+            ).to(torch.float32)
+
+            pos_idx_tensor = torch.tensor(positive_indices, device=candidate_scores.device, dtype=torch.long)
+            row_indices = group_start + pos_idx_tensor
+            rewards.index_copy_(0, row_indices, target_reward.expand_as(pos_idx_tensor).to(torch.float32))
+            positive_mask.index_fill_(0, row_indices, 1.0)
+
+            ranks[group_start:group_end] = rank_float
+            dcg_values[group_start:group_end] = dcg_reward.to(torch.float32)
+            soft_values[group_start:group_end] = soft_reward.to(torch.float32)
+            margin_values[group_start:group_end] = margin_reward.to(torch.float32)
+            negative_counts[group_start:group_end] = float(len(negative_indices))
+
+        return rewards, {
+            "rank": ranks,
+            "dcg_reward": dcg_values,
+            "soft_reward": soft_values,
+            "margin_reward": margin_values,
+            "positive_mask": positive_mask,
+            "negative_count": negative_counts,
+            "sequence_score": candidate_scores.detach(),
+            "reward": rewards.detach(),
+        }
+
+    def _pad_completions_to_length(self, completion_ids, completion_mask, target_length):
+        current_length = completion_ids.size(1)
+        if current_length == target_length:
+            return completion_ids, completion_mask
+        if current_length > target_length:
+            return completion_ids[:, :target_length], completion_mask[:, :target_length]
+        pad_length = target_length - current_length
+        pad_id = self.processing_class.pad_token_id
+        if pad_id is None:
+            pad_id = self.processing_class.eos_token_id
+        ids_pad = torch.full(
+            (completion_ids.size(0), pad_length),
+            fill_value=pad_id,
+            dtype=completion_ids.dtype,
+            device=completion_ids.device,
+        )
+        mask_pad = torch.zeros(
+            (completion_mask.size(0), pad_length),
+            dtype=completion_mask.dtype,
+            device=completion_mask.device,
+        )
+        return torch.cat([completion_ids, ids_pad], dim=1), torch.cat([completion_mask, mask_pad], dim=1)
+
+    def _build_on_policy_listwise_candidates(
+        self,
+        generated_ids,
+        generated_mask,
+        target_completion_ids,
+        target_completion_mask,
+    ):
+        batch_size = generated_ids.size(0)
+        if batch_size % self.num_generations != 0:
+            raise ValueError(
+                f"on_policy_listwise candidates expect batch_size divisible by num_generations, "
+                f"got batch_size={batch_size}, num_generations={self.num_generations}"
+            )
+
+        max_completion_length = max(generated_ids.size(1), target_completion_ids.size(1))
+        completion_ids, completion_mask = self._pad_completions_to_length(
+            generated_ids,
+            generated_mask,
+            max_completion_length,
+        )
+        target_ids, target_mask = self._pad_completions_to_length(
+            target_completion_ids,
+            target_completion_mask,
+            max_completion_length,
+        )
+
+        group_starts = torch.arange(0, batch_size, self.num_generations, device=generated_ids.device)
+        completion_ids = completion_ids.clone()
+        completion_mask = completion_mask.clone()
+        completion_ids[group_starts] = target_ids[group_starts]
+        completion_mask[group_starts] = target_mask[group_starts]
+        return completion_ids, completion_mask
+
     @torch.no_grad()
     def _generate_on_policy_completion_ids(self, prompt_ids, prompt_mask):
         generation_model = self._unwrap_latent_model()
@@ -915,7 +1096,7 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             advantages_raw = gathered_rewards - baseline
             advantages_norm = torch.norm(advantages_raw) + 1e-6
             advantages = advantages_raw / advantages_norm
-        elif self.reward_backend == "on_policy":
+        elif self.reward_backend in ("on_policy", "on_policy_listwise"):
             baseline = rewards_group.mean(dim=1, keepdim=True)
             advantages_raw = rewards_group - baseline
             advantages_std = rewards_group.std(dim=1, keepdim=True, unbiased=False)
@@ -1011,6 +1192,107 @@ class NoiseGRPORecTrainer(GRPOTrainer):
             "noise": noise,
         }
 
+    def _generate_and_score_on_policy_listwise(
+        self,
+        prompt_ids,
+        prompt_mask,
+        target_completion_ids,
+        target_completion_mask,
+    ):
+        device = self.accelerator.device
+        generated_ids, generated_mask = self._generate_on_policy_completion_ids(prompt_ids, prompt_mask)
+        completion_ids, completion_mask = self._build_on_policy_listwise_candidates(
+            generated_ids=generated_ids,
+            generated_mask=generated_mask,
+            target_completion_ids=target_completion_ids,
+            target_completion_mask=target_completion_mask,
+        )
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+        batch_size = input_ids.size(0)
+
+        latent_model = self._unwrap_latent_model()
+        with torch.no_grad():
+            original_embeds = latent_model.generate_embs(input_ids, attention_mask)
+            noise = torch.zeros(
+                (batch_size, original_embeds.size(-1)),
+                dtype=original_embeds.dtype,
+                device=device,
+            )
+            old_per_token_logps = self.my_get_per_token_logps(
+                self.model,
+                input_ids,
+                original_embeds,
+                attention_mask,
+                logits_to_keep,
+            )
+            if self.beta == 0.0:
+                ref_per_token_logps = None
+            else:
+                ref_per_token_logps = self.my_get_per_token_logps(
+                    self.ref_model,
+                    input_ids,
+                    original_embeds,
+                    attention_mask,
+                    logits_to_keep,
+                )
+
+        labels_length = completion_mask.sum(dim=-1).clamp_min(1).to(old_per_token_logps.dtype)
+        avg_logp = (
+            old_per_token_logps.detach() * completion_mask.to(old_per_token_logps.dtype)
+        ).sum(dim=-1) / labels_length
+        candidate_titles = self._decode_generation_titles(completion_ids, completion_mask)
+        target_titles = self._decode_generation_titles(target_completion_ids, target_completion_mask)
+        output_reward, listwise_logs = self._compute_on_policy_listwise_reward(
+            candidate_scores=avg_logp,
+            avg_logp=avg_logp,
+            candidate_titles=candidate_titles,
+            target_titles=target_titles,
+        )
+        advantages, advantages_norm = self._build_advantages(output_reward)
+
+        mode = "eval" if self.control.should_evaluate else "train"
+        self._metrics[mode]["on_policy_listwise_reward"].append(
+            self.accelerator.gather_for_metrics(output_reward).mean().item()
+        )
+        self._metrics[mode]["on_policy_listwise_rank"].append(
+            self.accelerator.gather_for_metrics(listwise_logs["rank"]).mean().item()
+        )
+        self._metrics[mode]["on_policy_listwise_dcg_reward"].append(
+            self.accelerator.gather_for_metrics(listwise_logs["dcg_reward"]).mean().item()
+        )
+        self._metrics[mode]["on_policy_listwise_soft_reward"].append(
+            self.accelerator.gather_for_metrics(listwise_logs["soft_reward"]).mean().item()
+        )
+        self._metrics[mode]["on_policy_listwise_margin_reward"].append(
+            self.accelerator.gather_for_metrics(listwise_logs["margin_reward"]).mean().item()
+        )
+        self._metrics[mode]["on_policy_listwise_positive_rate"].append(
+            self.accelerator.gather_for_metrics(listwise_logs["positive_mask"]).mean().item()
+        )
+        self._metrics[mode]["on_policy_listwise_negative_count"].append(
+            self.accelerator.gather_for_metrics(listwise_logs["negative_count"]).mean().item()
+        )
+        self._metrics[mode]["on_policy_listwise_sequence_score"].append(
+            self.accelerator.gather_for_metrics(listwise_logs["sequence_score"]).mean().item()
+        )
+        self._metrics[mode]["on_policy_listwise_advantages_norm"].append(
+            advantages_norm.detach().item() if torch.is_tensor(advantages_norm) else float(advantages_norm)
+        )
+
+        return {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "old_per_token_logps": old_per_token_logps,
+            "ref_per_token_logps": ref_per_token_logps,
+            "advantages": advantages,
+            "original_embeds": original_embeds,
+            "noise": noise,
+        }
+
     def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
 
@@ -1032,6 +1314,13 @@ class NoiseGRPORecTrainer(GRPOTrainer):
 
         if self.reward_backend == "on_policy":
             return self._generate_and_score_on_policy(
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                target_completion_ids=completion_ids,
+                target_completion_mask=completion_mask,
+            )
+        if self.reward_backend == "on_policy_listwise":
+            return self._generate_and_score_on_policy_listwise(
                 prompt_ids=prompt_ids,
                 prompt_mask=prompt_mask,
                 target_completion_ids=completion_ids,
@@ -1244,6 +1533,10 @@ class NoiseGRPORecTrainer(GRPOTrainer):
 
         # Log the metrics
         mode = "eval" if self.control.should_evaluate else "train"
+        balance_loss, balance_attention = self._get_moe_balance_loss(latent_model)
+        if balance_loss is not None:
+            loss = loss + balance_loss.to(device=loss.device, dtype=loss.dtype)
+        self._log_moe_balance_metrics(balance_attention, mode)
 
         if self.beta != 0.0:
             mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()

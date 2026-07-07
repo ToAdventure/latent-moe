@@ -12,6 +12,7 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 : "${BASE_MODEL:=/data/gtq/latent-moe/models/Qwen2.5-1.5B}"
 : "${GPU_IDS:=${CUDA_VISIBLE_DEVICES:-0,1,2,3}}"
 : "${LATENT_LAYER_TYPE:=attention}"
+: "${MOE_EXPERT_TYPE:=mlp}"
 : "${MOE_NUM_EXPERTS:=4}"
 : "${MOE_TOP_K:=2}"
 : "${MOE_EXPERT_HIDDEN_SIZE:=0}"
@@ -20,6 +21,7 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 : "${MOE_ROUTER_TEMPERATURE:=1.0}"
 : "${MOE_ROUTER_JITTER_NOISE:=0.0}"
 : "${MOE_LOAD_BALANCE_WEIGHT:=0.01}"
+: "${MOE_BALANCE_LOSS_MODE:=fixed}"
 : "${MOE_FINE_GRAINED_FACTOR:=2}"
 : "${MOE_NUM_SHARED_EXPERTS:=1}"
 : "${MOE_SHARED_EXPERT_WEIGHT:=1.0}"
@@ -59,7 +61,9 @@ mkdir -p ${out}
 echo "Using BASE_MODEL=${BASE_MODEL}"
 echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} with NUM_GPUS=${NUM_GPUS}"
 echo "Using LATENT_LAYER_TYPE=${LATENT_LAYER_TYPE}"
+echo "Using MOE_EXPERT_TYPE=${MOE_EXPERT_TYPE}"
 echo "Using MOE_LOAD_BALANCE_WEIGHT=${MOE_LOAD_BALANCE_WEIGHT}"
+echo "Using MOE_BALANCE_LOSS_MODE=${MOE_BALANCE_LOSS_MODE}"
 echo "Using LOAD_BEST_MODEL_AT_END=${LOAD_BEST_MODEL_AT_END}"
 echo "Using SAVE_STRATEGY=${SAVE_STRATEGY}"
 echo "Using SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT}"
@@ -76,6 +80,7 @@ torchrun --nproc_per_node=${NUM_GPUS} --nnodes=1 --master_port=$port \
     --train_file ${train_file} --eval_file ${eval_file} \
     --output_dir ${out} --category ${category} --sample -1 \
     --latent_layer_type ${LATENT_LAYER_TYPE} \
+    --moe_expert_type ${MOE_EXPERT_TYPE} \
     --load_best_model_at_end "${LOAD_BEST_MODEL_AT_END}" \
     --save_strategy "${SAVE_STRATEGY}" \
     --save_total_limit "${SAVE_TOTAL_LIMIT}" \
@@ -96,6 +101,7 @@ torchrun --nproc_per_node=${NUM_GPUS} --nnodes=1 --master_port=$port \
     --moe_router_temperature ${MOE_ROUTER_TEMPERATURE} \
     --moe_router_jitter_noise ${MOE_ROUTER_JITTER_NOISE} \
     --moe_load_balance_weight ${MOE_LOAD_BALANCE_WEIGHT} \
+    --moe_balance_loss_mode ${MOE_BALANCE_LOSS_MODE} \
     --moe_fine_grained_factor ${MOE_FINE_GRAINED_FACTOR} \
     --moe_num_shared_experts ${MOE_NUM_SHARED_EXPERTS} \
     --moe_shared_expert_weight ${MOE_SHARED_EXPERT_WEIGHT} \

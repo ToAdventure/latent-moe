@@ -67,17 +67,19 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 : "${DISCARD_ZERO_ADVANTAGE_GROUPS:=true}"
 : "${NOISE_STD:=1.0}"
 : "${LATENT_LAYER_TYPE:=deepseek_moe}"
-: "${MOE_NUM_EXPERTS:=4}"
-: "${MOE_TOP_K:=2}"
-: "${MOE_EXPERT_HIDDEN_SIZE:=0}"
-: "${MOE_EXPERT_HIDDEN_MULTIPLIER:=1.0}"
-: "${MOE_DROPOUT:=0.0}"
-: "${MOE_ROUTER_TEMPERATURE:=1.0}"
-: "${MOE_ROUTER_JITTER_NOISE:=0.0}"
-: "${MOE_LOAD_BALANCE_WEIGHT:=0.0}"
-: "${MOE_FINE_GRAINED_FACTOR:=1}"
-: "${MOE_NUM_SHARED_EXPERTS:=1}"
-: "${MOE_SHARED_EXPERT_WEIGHT:=1.0}"
+: "${MOE_EXPERT_TYPE:=auto}"
+: "${MOE_NUM_EXPERTS:=auto}"
+: "${MOE_TOP_K:=auto}"
+: "${MOE_EXPERT_HIDDEN_SIZE:=auto}"
+: "${MOE_EXPERT_HIDDEN_MULTIPLIER:=auto}"
+: "${MOE_DROPOUT:=auto}"
+: "${MOE_ROUTER_TEMPERATURE:=auto}"
+: "${MOE_ROUTER_JITTER_NOISE:=auto}"
+: "${MOE_LOAD_BALANCE_WEIGHT:=auto}"
+: "${MOE_BALANCE_LOSS_MODE:=auto}"
+: "${MOE_FINE_GRAINED_FACTOR:=auto}"
+: "${MOE_NUM_SHARED_EXPERTS:=auto}"
+: "${MOE_SHARED_EXPERT_WEIGHT:=auto}"
 : "${USE_FSDP2:=False}"
 : "${FSDP2_ACTIVATION_CHECKPOINTING:=False}"
 : "${FSDP2_STATE_DICT_TYPE:=FULL_STATE_DICT}"
@@ -106,11 +108,13 @@ fi
 echo "Using GRPO_EXPERIMENT_NAME=${GRPO_EXPERIMENT_NAME}"
 echo "Using GRPO_LRS=${LRS[*]}"
 echo "Using LATENT_LAYER_TYPE=${LATENT_LAYER_TYPE}"
+echo "Using MOE_EXPERT_TYPE=${MOE_EXPERT_TYPE}"
 echo "Using MOE_NUM_EXPERTS=${MOE_NUM_EXPERTS}"
 echo "Using MOE_TOP_K=${MOE_TOP_K}"
 echo "Using MOE_FINE_GRAINED_FACTOR=${MOE_FINE_GRAINED_FACTOR}"
 echo "Using MOE_NUM_SHARED_EXPERTS=${MOE_NUM_SHARED_EXPERTS}"
 echo "Using MOE_LOAD_BALANCE_WEIGHT=${MOE_LOAD_BALANCE_WEIGHT}"
+echo "Using MOE_BALANCE_LOSS_MODE=${MOE_BALANCE_LOSS_MODE}"
 echo "Using USE_LISTWISE_REWARD=${USE_LISTWISE_REWARD}"
 echo "Using REWARD_BACKEND=${REWARD_BACKEND}"
 echo "Using FLR_REWARD_W_LOGP=${FLR_REWARD_W_LOGP}"
@@ -333,6 +337,7 @@ for category in "${CATEGORIES[@]}"; do
             --sanity_check_generation "${SANITY_CHECK_GENERATION}" \
             --generation_eval_steps "${GENERATION_EVAL_STEPS}" \
             --latent_layer_type "${LATENT_LAYER_TYPE}" \
+            --moe_expert_type "${MOE_EXPERT_TYPE}" \
             --moe_num_experts "${MOE_NUM_EXPERTS}" \
             --moe_top_k "${MOE_TOP_K}" \
             --moe_expert_hidden_size "${MOE_EXPERT_HIDDEN_SIZE}" \
@@ -341,6 +346,7 @@ for category in "${CATEGORIES[@]}"; do
             --moe_router_temperature "${MOE_ROUTER_TEMPERATURE}" \
             --moe_router_jitter_noise "${MOE_ROUTER_JITTER_NOISE}" \
             --moe_load_balance_weight "${MOE_LOAD_BALANCE_WEIGHT}" \
+            --moe_balance_loss_mode "${MOE_BALANCE_LOSS_MODE}" \
             --moe_fine_grained_factor "${MOE_FINE_GRAINED_FACTOR}" \
             --moe_num_shared_experts "${MOE_NUM_SHARED_EXPERTS}" \
             --moe_shared_expert_weight "${MOE_SHARED_EXPERT_WEIGHT}" \
